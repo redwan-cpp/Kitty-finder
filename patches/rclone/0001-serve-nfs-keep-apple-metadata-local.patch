@@ -1,0 +1,601 @@
+diff --git a/cmd/serve/nfs/applemeta.go b/cmd/serve/nfs/applemeta.go
+new file mode 100644
+index 0000000..b283ca7
+--- /dev/null
++++ b/cmd/serve/nfs/applemeta.go
+@@ -0,0 +1,189 @@
++//go:build unix
++
++package nfs
++
++import (
++	"errors"
++	"io"
++	"os"
++	"path"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"time"
++
++	billy "github.com/go-git/go-billy/v5"
++	"github.com/willscott/go-nfs/file"
++)
++
++// isAppleMeta reports whether name is a macOS metadata file which should be
++// kept on the local machine rather than stored on the remote.
++//
++// The macOS NFS client has no native extended attribute support over NFSv3,
++// so it stores xattrs (Finder info, quarantine, provenance, resource forks)
++// in AppleDouble "._name" files next to the real file. Finder also writes
++// ".DS_Store" files. Uploading these clutters the remote for every other
++// client, so with --nfs-apple-meta-dir they are kept locally instead.
++func isAppleMeta(name string) bool {
++	base := path.Base(name)
++	return strings.HasPrefix(base, "._") || base == ".DS_Store"
++}
++
++// metaFS stores Apple metadata files in a local directory, mirroring the
++// paths they have in the VFS.
++type metaFS struct {
++	root string
++}
++
++// newMetaFS returns a metaFS rooted at dir, creating it if needed.
++func newMetaFS(dir string) (*metaFS, error) {
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		return nil, err
++	}
++	return &metaFS{root: dir}, nil
++}
++
++// local returns the on disk path for the VFS path name. Cleaning it as an
++// absolute path removes any ".." so it can't escape root.
++func (m *metaFS) local(name string) string {
++	return filepath.Join(m.root, filepath.FromSlash(path.Clean("/"+name)))
++}
++
++// metaFile is an *os.File which satisfies billy.File
++type metaFile struct {
++	*os.File
++	name string
++}
++
++func (f metaFile) Name() string  { return f.name }
++func (f metaFile) Lock() error   { return nil }
++func (f metaFile) Unlock() error { return nil }
++
++// metaInfo reports metadata files with inode numbers that can't collide
++// with the VFS ones, which count up from 1.
++type metaInfo struct {
++	os.FileInfo
++	sys file.FileInfo
++}
++
++func (fi metaInfo) Sys() any { return &fi.sys }
++
++func newMetaInfo(fi os.FileInfo) os.FileInfo {
++	info := metaInfo{FileInfo: fi, sys: file.FileInfo{Nlink: 1}}
++	if s, ok := fi.Sys().(*syscall.Stat_t); ok {
++		info.sys = file.FileInfo{Nlink: uint32(s.Nlink), UID: s.Uid, GID: s.Gid, Fileid: s.Ino | 1<<63}
++	}
++	return info
++}
++
++func (m *metaFS) mkParent(name string) error {
++	return os.MkdirAll(filepath.Dir(m.local(name)), 0o700)
++}
++
++func (m *metaFS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, error) {
++	if flag&os.O_CREATE != 0 {
++		if err := m.mkParent(name); err != nil {
++			return nil, err
++		}
++	}
++	fd, err := os.OpenFile(m.local(name), flag, perm)
++	if err != nil {
++		return nil, err
++	}
++	return metaFile{File: fd, name: name}, nil
++}
++
++func (m *metaFS) Stat(name string) (os.FileInfo, error) {
++	fi, err := os.Stat(m.local(name))
++	if err != nil {
++		return nil, err
++	}
++	return newMetaInfo(fi), nil
++}
++
++func (m *metaFS) Lstat(name string) (os.FileInfo, error) {
++	fi, err := os.Lstat(m.local(name))
++	if err != nil {
++		return nil, err
++	}
++	return newMetaInfo(fi), nil
++}
++
++func (m *metaFS) Rename(oldpath, newpath string) error {
++	if err := m.mkParent(newpath); err != nil {
++		return err
++	}
++	return os.Rename(m.local(oldpath), m.local(newpath))
++}
++
++func (m *metaFS) Remove(name string) error    { return os.Remove(m.local(name)) }
++func (m *metaFS) RemoveAll(name string) error { return os.RemoveAll(m.local(name)) }
++func (m *metaFS) MkdirAll(name string, perm os.FileMode) error {
++	return os.MkdirAll(m.local(name), perm)
++}
++func (m *metaFS) Chmod(name string, mode os.FileMode) error { return os.Chmod(m.local(name), mode) }
++func (m *metaFS) Chtimes(name string, atime, mtime time.Time) error {
++	return os.Chtimes(m.local(name), atime, mtime)
++}
++
++// isMeta reports whether the VFS path name should be served from f.meta
++func (f *FS) isMeta(name string) bool {
++	return f.meta != nil && isAppleMeta(name)
++}
++
++// metaFollow mirrors a rename of a remote directory onto f.meta so the
++// metadata of the files inside it follows it. Errors are ignored as the
++// metadata is only a convenience.
++func (f *FS) metaFollow(oldpath, newpath string) {
++	if f.meta == nil {
++		return
++	}
++	if fi, err := f.meta.Stat(oldpath); err != nil || !fi.IsDir() {
++		return
++	}
++	_ = f.meta.RemoveAll(newpath)
++	_ = f.meta.Rename(oldpath, newpath)
++}
++
++// metaForget removes any metadata stored under a removed remote directory.
++func (f *FS) metaForget(name string) {
++	if f.meta == nil {
++		return
++	}
++	if fi, err := f.meta.Stat(name); err == nil && fi.IsDir() {
++		_ = f.meta.RemoveAll(name)
++	}
++}
++
++// crossRename moves a file between the remote and f.meta (or the other way)
++// by copying it and then removing the source.
++func (f *FS) crossRename(oldpath, newpath string) (err error) {
++	var src, dst billy.File
++	if f.isMeta(oldpath) {
++		src, err = f.meta.OpenFile(oldpath, os.O_RDONLY, 0)
++	} else {
++		src, err = f.vfs.Open(oldpath)
++	}
++	if err != nil {
++		return err
++	}
++	defer func() { _ = src.Close() }()
++	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
++	if f.isMeta(newpath) {
++		dst, err = f.meta.OpenFile(newpath, flags, 0o600)
++	} else {
++		dst, err = f.vfs.OpenFile(newpath, flags, 0o666)
++	}
++	if err != nil {
++		return err
++	}
++	_, err = io.Copy(dst, src)
++	err = errors.Join(err, dst.Close())
++	if err != nil {
++		return err
++	}
++	if f.isMeta(oldpath) {
++		return f.meta.Remove(oldpath)
++	}
++	return f.vfs.Remove(oldpath)
++}
+diff --git a/cmd/serve/nfs/applemeta_test.go b/cmd/serve/nfs/applemeta_test.go
+new file mode 100644
+index 0000000..4d8c76c
+--- /dev/null
++++ b/cmd/serve/nfs/applemeta_test.go
+@@ -0,0 +1,174 @@
++//go:build unix
++
++package nfs
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/vfs"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestIsAppleMeta(t *testing.T) {
++	for name, want := range map[string]bool{
++		"._file.txt":     true,
++		"dir/._file.txt": true,
++		"._dir":          true,
++		".DS_Store":      true,
++		"a/b/.DS_Store":  true,
++		"file.txt":       false,
++		"._":             true,
++		"_.file":         false,
++		".hidden":        false,
++		"dir._x/file":    false,
++		"x.DS_Store":     false,
++	} {
++		assert.Equal(t, want, isAppleMeta(name), name)
++	}
++}
++
++// newMetaTestFS returns an FS on a local remote with Apple metadata
++// stored separately, plus the remote and metadata directories.
++func newMetaTestFS(t *testing.T) (bfs *FS, remoteDir, metaDir string) {
++	ctx := t.Context()
++	remoteDir, metaDir = t.TempDir(), t.TempDir()
++	f, err := fs.NewFs(ctx, remoteDir)
++	require.NoError(t, err)
++	opt := vfscommon.Opt
++	opt.CacheMode = vfscommon.CacheModeOff
++	v := vfs.New(ctx, f, &opt)
++	t.Cleanup(v.Shutdown)
++	meta, err := newMetaFS(metaDir)
++	require.NoError(t, err)
++	return &FS{vfs: v, meta: meta}, remoteDir, metaDir
++}
++
++func writeFile(t *testing.T, bfs *FS, name, data string) {
++	fd, err := bfs.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
++	require.NoError(t, err)
++	_, err = fd.Write([]byte(data))
++	require.NoError(t, err)
++	require.NoError(t, fd.Close())
++}
++
++func readFile(t *testing.T, bfs *FS, name string) string {
++	fd, err := bfs.Open(name)
++	require.NoError(t, err)
++	defer func() { require.NoError(t, fd.Close()) }()
++	b, err := io.ReadAll(fd)
++	require.NoError(t, err)
++	return string(b)
++}
++
++func exists(path string) bool {
++	_, err := os.Stat(path)
++	return err == nil
++}
++
++func TestAppleMetaStoredLocally(t *testing.T) {
++	bfs, remoteDir, metaDir := newMetaTestFS(t)
++
++	require.NoError(t, bfs.MkdirAll("dir", 0o755))
++	writeFile(t, bfs, "dir/file.txt", "data")
++	writeFile(t, bfs, "dir/._file.txt", "xattrs")
++	writeFile(t, bfs, "dir/.DS_Store", "finder")
++
++	// Real files go to the remote, metadata stays local
++	assert.True(t, exists(filepath.Join(remoteDir, "dir", "file.txt")))
++	assert.False(t, exists(filepath.Join(remoteDir, "dir", "._file.txt")))
++	assert.False(t, exists(filepath.Join(remoteDir, "dir", ".DS_Store")))
++	assert.True(t, exists(filepath.Join(metaDir, "dir", "._file.txt")))
++	assert.True(t, exists(filepath.Join(metaDir, "dir", ".DS_Store")))
++
++	// Both read back through the FS
++	assert.Equal(t, "data", readFile(t, bfs, "dir/file.txt"))
++	assert.Equal(t, "xattrs", readFile(t, bfs, "dir/._file.txt"))
++	fi, err := bfs.Lstat("dir/._file.txt")
++	require.NoError(t, err)
++	assert.Equal(t, int64(6), fi.Size())
++	assert.NoError(t, bfs.Chmod("dir/._file.txt", 0o600))
++	assert.NoError(t, bfs.Chown("dir/._file.txt", 501, 20))
++
++	// Metadata is not listed, even if a stray copy exists on the remote
++	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, "dir", "._stray"), []byte("x"), 0o644))
++	entries, err := bfs.ReadDir("dir")
++	require.NoError(t, err)
++	var names []string
++	for _, e := range entries {
++		names = append(names, e.Name())
++	}
++	assert.Equal(t, []string{"file.txt"}, names)
++}
++
++func TestAppleMetaRenameRemove(t *testing.T) {
++	bfs, remoteDir, metaDir := newMetaTestFS(t)
++
++	require.NoError(t, bfs.MkdirAll("dir", 0o755))
++	writeFile(t, bfs, "dir/a.txt", "a")
++	writeFile(t, bfs, "dir/._a.txt", "meta-a")
++
++	// Renaming the metadata file renames it locally
++	require.NoError(t, bfs.Rename("dir/a.txt", "dir/b.txt"))
++	require.NoError(t, bfs.Rename("dir/._a.txt", "dir/._b.txt"))
++	assert.True(t, exists(filepath.Join(remoteDir, "dir", "b.txt")))
++	assert.True(t, exists(filepath.Join(metaDir, "dir", "._b.txt")))
++	assert.False(t, exists(filepath.Join(metaDir, "dir", "._a.txt")))
++
++	// Renaming a directory takes its metadata with it
++	require.NoError(t, bfs.Rename("dir", "moved"))
++	assert.True(t, exists(filepath.Join(remoteDir, "moved", "b.txt")))
++	assert.True(t, exists(filepath.Join(metaDir, "moved", "._b.txt")))
++	assert.False(t, exists(filepath.Join(metaDir, "dir")))
++
++	// Renaming between a metadata name and a real name copies across
++	writeFile(t, bfs, "moved/._tmp", "promoted")
++	require.NoError(t, bfs.Rename("moved/._tmp", "moved/real.txt"))
++	assert.Equal(t, "promoted", readFile(t, bfs, "moved/real.txt"))
++	assert.True(t, exists(filepath.Join(remoteDir, "moved", "real.txt")))
++	assert.False(t, exists(filepath.Join(metaDir, "moved", "._tmp")))
++	require.NoError(t, bfs.Rename("moved/real.txt", "moved/._demoted"))
++	assert.False(t, exists(filepath.Join(remoteDir, "moved", "real.txt")))
++	assert.Equal(t, "promoted", readFile(t, bfs, "moved/._demoted"))
++
++	// Removing a metadata file removes it locally
++	require.NoError(t, bfs.Remove("moved/._b.txt"))
++	assert.False(t, exists(filepath.Join(metaDir, "moved", "._b.txt")))
++	_, err := bfs.Stat("moved/._b.txt")
++	assert.ErrorIs(t, err, os.ErrNotExist)
++
++	// Removing a directory forgets the metadata left under it
++	require.NoError(t, bfs.Remove("moved/b.txt"))
++	require.NoError(t, bfs.Remove("moved"))
++	assert.False(t, exists(filepath.Join(remoteDir, "moved")))
++	assert.False(t, exists(filepath.Join(metaDir, "moved")))
++}
++
++func TestAppleMetaDisabled(t *testing.T) {
++	ctx := t.Context()
++	remoteDir := t.TempDir()
++	f, err := fs.NewFs(ctx, remoteDir)
++	require.NoError(t, err)
++	opt := vfscommon.Opt
++	v := vfs.New(ctx, f, &opt)
++	defer v.Shutdown()
++	bfs := &FS{vfs: v}
++
++	// Without a metadata dir, ._ files are stored on the remote as before
++	writeFile(t, bfs, "._file", "x")
++	assert.True(t, exists(filepath.Join(remoteDir, "._file")))
++}
++
++// A metadata name must not escape the metadata directory
++func TestAppleMetaPathTraversal(t *testing.T) {
++	bfs, _, metaDir := newMetaTestFS(t)
++	_, err := bfs.OpenFile("../../._escape", os.O_WRONLY|os.O_CREATE, 0o644)
++	if err == nil {
++		assert.False(t, exists(filepath.Join(filepath.Dir(filepath.Dir(metaDir)), "._escape")))
++	}
++}
+diff --git a/cmd/serve/nfs/filesystem.go b/cmd/serve/nfs/filesystem.go
+index 2ee8eca..bc2f284 100644
+--- a/cmd/serve/nfs/filesystem.go
++++ b/cmd/serve/nfs/filesystem.go
+@@ -45,7 +45,8 @@ func setSys(fi os.FileInfo) {
+ // FS is our wrapper around the VFS to properly support billy.Filesystem interface
+ type FS struct {
+ 	vfs  *vfs.VFS
+-	root string // absolute path within the VFS this FS is rooted at; empty means VFS root
++	root string  // absolute path within the VFS this FS is rooted at; empty means VFS root
++	meta *metaFS // if set, Apple metadata files are stored here instead of the VFS
+ }
+ 
+ // fullPath returns the absolute path within the VFS for name, which is
+@@ -60,7 +61,7 @@ func (f *FS) fullPath(name string) string {
+ // subFS returns a new *FS rooted at root within the VFS. root must already
+ // be a cleaned absolute path that the caller has validated as a directory.
+ func (f *FS) subFS(root string) *FS {
+-	return &FS{vfs: f.vfs, root: root}
++	return &FS{vfs: f.vfs, root: root, meta: f.meta}
+ }
+ 
+ // ReadDir implements read dir
+@@ -71,16 +72,25 @@ func (f *FS) ReadDir(p string) (dir []os.FileInfo, err error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	kept := dir[:0]
+ 	for _, fi := range dir {
++		// Remote copies of Apple metadata are shadowed by the local ones
++		if f.isMeta(fi.Name()) {
++			continue
++		}
+ 		setSys(fi)
++		kept = append(kept, fi)
+ 	}
+-	return dir, nil
++	return kept, nil
+ }
+ 
+ // Create implements creating new files
+ func (f *FS) Create(filename string) (node billy.File, err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("%v, err=%v", &node, &err)
++	if f.isMeta(filename) {
++		return f.meta.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
++	}
+ 	return f.vfs.Create(filename)
+ }
+ 
+@@ -88,6 +98,9 @@ func (f *FS) Create(filename string) (node billy.File, err error) {
+ func (f *FS) Open(filename string) (node billy.File, err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("%v, err=%v", &node, &err)
++	if f.isMeta(filename) {
++		return f.meta.OpenFile(filename, os.O_RDONLY, 0)
++	}
+ 	return f.vfs.Open(filename)
+ }
+ 
+@@ -95,6 +108,9 @@ func (f *FS) Open(filename string) (node billy.File, err error) {
+ func (f *FS) OpenFile(filename string, flag int, perm os.FileMode) (node billy.File, err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "flag=0x%X, perm=%v", flag, perm)("%v, err=%v", &node, &err)
++	if f.isMeta(filename) {
++		return f.meta.OpenFile(filename, flag, perm)
++	}
+ 	return f.vfs.OpenFile(filename, flag, perm)
+ }
+ 
+@@ -102,6 +118,9 @@ func (f *FS) OpenFile(filename string, flag int, perm os.FileMode) (node billy.F
+ func (f *FS) Stat(filename string) (fi os.FileInfo, err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("fi=%v, err=%v", &fi, &err)
++	if f.isMeta(filename) {
++		return f.meta.Stat(filename)
++	}
+ 	fi, err = f.vfs.Stat(filename)
+ 	if err != nil {
+ 		return nil, err
+@@ -115,14 +134,32 @@ func (f *FS) Rename(oldpath, newpath string) (err error) {
+ 	oldpath = f.fullPath(oldpath)
+ 	newpath = f.fullPath(newpath)
+ 	defer log.Trace(oldpath, "newpath=%q", newpath)("err=%v", &err)
+-	return f.vfs.Rename(oldpath, newpath)
++	oldMeta, newMeta := f.isMeta(oldpath), f.isMeta(newpath)
++	switch {
++	case oldMeta && newMeta:
++		return f.meta.Rename(oldpath, newpath)
++	case oldMeta != newMeta:
++		return f.crossRename(oldpath, newpath)
++	}
++	err = f.vfs.Rename(oldpath, newpath)
++	if err == nil {
++		f.metaFollow(oldpath, newpath)
++	}
++	return err
+ }
+ 
+ // Remove deletes a file
+ func (f *FS) Remove(filename string) (err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("err=%v", &err)
+-	return f.vfs.Remove(filename)
++	if f.isMeta(filename) {
++		return f.meta.Remove(filename)
++	}
++	err = f.vfs.Remove(filename)
++	if err == nil {
++		f.metaForget(filename)
++	}
++	return err
+ }
+ 
+ // Join joins path elements
+@@ -142,6 +179,9 @@ func (f *FS) TempFile(dir, prefix string) (node billy.File, err error) {
+ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "perm=%v", perm)("err=%v", &err)
++	if f.isMeta(filename) {
++		return f.meta.MkdirAll(filename, perm)
++	}
+ 	parts := strings.Split(filename, "/")
+ 	for i := range parts {
+ 		current := strings.Join(parts[:i+1], "/")
+@@ -160,6 +200,9 @@ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
+ func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
+ 	filename = f.fullPath(filename)
+ 	defer log.Trace(filename, "")("fi=%v, err=%v", &fi, &err)
++	if f.isMeta(filename) {
++		return f.meta.Lstat(filename)
++	}
+ 	fi, err = f.vfs.Stat(filename)
+ 	if err != nil {
+ 		return nil, err
+@@ -172,6 +215,9 @@ func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
+ func (f *FS) Symlink(target, link string) (err error) {
+ 	link = f.fullPath(link)
+ 	defer log.Trace(target, "link=%q", link)("err=%v", &err)
++	if f.isMeta(link) {
++		return os.ErrPermission
++	}
+ 	return f.vfs.Symlink(target, link)
+ }
+ 
+@@ -179,6 +225,9 @@ func (f *FS) Symlink(target, link string) (err error) {
+ func (f *FS) Readlink(link string) (result string, err error) {
+ 	link = f.fullPath(link)
+ 	defer log.Trace(link, "")("result=%q, err=%v", &result, &err)
++	if f.isMeta(link) {
++		return "", os.ErrInvalid
++	}
+ 	return f.vfs.Readlink(link)
+ }
+ 
+@@ -186,6 +235,9 @@ func (f *FS) Readlink(link string) (result string, err error) {
+ func (f *FS) Chmod(name string, mode os.FileMode) (err error) {
+ 	name = f.fullPath(name)
+ 	defer log.Trace(name, "mode=%v", mode)("err=%v", &err)
++	if f.isMeta(name) {
++		return f.meta.Chmod(name, mode)
++	}
+ 	err = f.vfs.Chmod(name, mode)
+ 	// Mask Chmod not implemented
+ 	if err == vfs.ENOSYS {
+@@ -204,6 +256,10 @@ func (f *FS) Lchown(name string, uid, gid int) (err error) {
+ func (f *FS) Chown(name string, uid, gid int) (err error) {
+ 	name = f.fullPath(name)
+ 	defer log.Trace(name, "uid=%d, gid=%d", uid, gid)("err=%v", &err)
++	if f.isMeta(name) {
++		// Local metadata files are always owned by the user running rclone
++		return nil
++	}
+ 	err = f.vfs.Chown(name, uid, gid)
+ 	// Mask Chown not implemented
+ 	if err == vfs.ENOSYS {
+@@ -216,6 +272,9 @@ func (f *FS) Chown(name string, uid, gid int) (err error) {
+ func (f *FS) Chtimes(name string, atime time.Time, mtime time.Time) (err error) {
+ 	name = f.fullPath(name)
+ 	defer log.Trace(name, "atime=%v, mtime=%v", atime, mtime)("err=%v", &err)
++	if f.isMeta(name) {
++		return f.meta.Chtimes(name, atime, mtime)
++	}
+ 	return f.vfs.Chtimes(name, atime, mtime)
+ }
+ 
+diff --git a/cmd/serve/nfs/handler.go b/cmd/serve/nfs/handler.go
+index 0b354d1..ce199ac 100644
+--- a/cmd/serve/nfs/handler.go
++++ b/cmd/serve/nfs/handler.go
+@@ -33,6 +33,12 @@ func NewHandler(ctx context.Context, vfs *vfs.VFS, opt *Options) (handler nfs.Ha
+ 		opt:     *opt,
+ 		billyFS: &FS{vfs: vfs},
+ 	}
++	if h.opt.AppleMetaDir != "" {
++		h.billyFS.meta, err = newMetaFS(h.opt.AppleMetaDir)
++		if err != nil {
++			return nil, fmt.Errorf("failed to make apple metadata dir: %w", err)
++		}
++	}
+ 	h.opt.HandleLimit = h.opt.Limit()
+ 	h.Cache, err = h.getCache()
+ 	if err != nil {
+diff --git a/cmd/serve/nfs/nfs.go b/cmd/serve/nfs/nfs.go
+index 3a4b9a2..32d35b9 100644
+--- a/cmd/serve/nfs/nfs.go
++++ b/cmd/serve/nfs/nfs.go
+@@ -42,6 +42,10 @@ var OptionsInfo = fs.Options{{
+ 	Name:    "nfs_cache_dir",
+ 	Default: "",
+ 	Help:    "The directory the NFS handle cache will use if set",
++}, {
++	Name:    "nfs_apple_meta_dir",
++	Default: "",
++	Help:    "If set, keep macOS AppleDouble (._*) and .DS_Store files in this local directory instead of uploading them",
+ }}
+ 
+ func init() {
+@@ -72,6 +76,7 @@ type Options struct {
+ 	HandleLimit    int         `config:"nfs_cache_handle_limit"` // max file handles cached by go-nfs CachingHandler
+ 	HandleCache    handleCache `config:"nfs_cache_type"`         // what kind of handle cache to use
+ 	HandleCacheDir string      `config:"nfs_cache_dir"`          // where the handle cache should be stored
++	AppleMetaDir   string      `config:"nfs_apple_meta_dir"`     // where to keep macOS metadata files instead of the remote
+ }
+ 
+ // Opt is the default set of serve nfs options

@@ -1,0 +1,9 @@
+build/
+.build/
+dist/
+*.app
+.DS_Store
+.swiftpm/
+Config/GoogleOAuth.plist
+Config/google-client.json
+Config/client_secret*.json
