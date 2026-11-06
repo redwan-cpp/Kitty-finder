@@ -51,18 +51,23 @@ final class MountController {
         wantRunning = false
         restartTask?.cancel()
         guard let process else {
+            await MountTable.forceUnmount(mountPath.path)
             state = .stopped
             return
         }
-        process.terminate() // SIGTERM: rclone unmounts and exits
-        for _ in 0..<100 where process.isRunning {
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        if process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
-        }
-        if MountTable.isMounted(mountPath.path) {
-            MountTable.forceUnmount(mountPath.path)
+        // Unmount while the engine can still answer: it notices and exits by itself.
+        // Signalling it first makes rclone run `diskutil unmount force`, which can hang
+        // (for example with the drive open in Finder) and leave a dead mount if the
+        // engine is then killed.
+        await MountTable.forceUnmount(mountPath.path)
+        // After a forced unmount the engine doesn't notice by itself; once signalled,
+        // it finds nothing left to unmount and exits at once.
+        let pid = process.processIdentifier
+        if await !ProcessWait.untilExited([pid], timeout: 1).isEmpty {
+            process.terminate()
+            if await !ProcessWait.untilExited([pid], timeout: 5).isEmpty {
+                kill(pid, SIGKILL)
+            }
         }
         state = .stopped
     }
@@ -82,14 +87,31 @@ final class MountController {
     }
 
     private var relaunchOnExit = false
+    private var clearingDeadMount = false
 
     private func launch() {
-        guard wantRunning, process == nil else { return }
+        guard wantRunning, process == nil, !clearingDeadMount else { return }
         let fm = FileManager.default
         let mountPath = self.mountPath.path
 
-        // A previous rclone that died leaves a dead mount behind
-        if MountTable.isMounted(mountPath) { MountTable.forceUnmount(mountPath) }
+        // A previous rclone that died leaves a dead mount behind. Unmounting it can
+        // block, so do it off the main thread and come back here when it's gone.
+        if MountTable.isMounted(mountPath) {
+            clearingDeadMount = true
+            state = .starting
+            Task { [weak self] in
+                let cleared = await MountTable.forceUnmount(mountPath)
+                guard let self else { return }
+                self.clearingDeadMount = false
+                if cleared {
+                    self.launch()
+                } else {
+                    self.fail("macOS is still disconnecting this drive. If it says “Server connections interrupted”, click Disconnect.")
+                    self.scheduleRestart()
+                }
+            }
+            return
+        }
         do {
             try fm.createDirectory(atPath: mountPath, withIntermediateDirectories: true)
             try fm.createDirectory(at: paths.cacheDir(for: account.id), withIntermediateDirectories: true)
@@ -107,7 +129,12 @@ final class MountController {
 
         let process = Process()
         process.executableURL = rclone.binary
-        process.arguments = MountArguments.nfsmount(config)
+        // For benchmarking: `defaults write app.kittyfinder.KittyFinder UseBaselineTuning -bool true`
+        // restores the original settings; ExtraMountArguments (string array) adds rclone flags.
+        let defaults = UserDefaults.standard
+        let tuning: MountTuning = defaults.bool(forKey: "UseBaselineTuning") ? .baseline : .tuned
+        process.arguments = MountArguments.nfsmount(config, tuning: tuning,
+                                                    extra: defaults.stringArray(forKey: "ExtraMountArguments") ?? [])
         process.environment = MountArguments.environment(configPassword: configPassword, rcUser: rc.user, rcPass: rc.password)
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
@@ -151,7 +178,10 @@ final class MountController {
         remoteControl = nil
         pollTask?.cancel()
         stats = nil
-        if MountTable.isMounted(mountPath.path) { MountTable.forceUnmount(mountPath.path) }
+        if MountTable.isMounted(mountPath.path) {
+            let path = mountPath.path
+            Task { await MountTable.forceUnmount(path) } // a relaunch waits for this itself
+        }
         guard wantRunning else {
             state = .stopped
             return

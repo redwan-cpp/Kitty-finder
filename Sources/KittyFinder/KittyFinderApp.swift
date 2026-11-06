@@ -23,7 +23,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
 
+    private var terminationSignal: DispatchSourceSignal?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A plain SIGTERM (kill, pkill) would end the app on the spot and leave its
+        // drives' engines behind. Turn it into a normal quit that stops them cleanly.
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        // Not NSApp.terminate directly: this handler runs inside the main queue, and
+        // terminate's wait for stopAll (a main-actor task) would then never finish.
+        source.setEventHandler { RunLoop.main.perform { NSApp.terminate(nil) } }
+        source.resume()
+        terminationSignal = source
+
         model.openSettingsHandler = { [weak self] in self?.showSettings() }
         statusItem = StatusItemController(model: model)
         Task {

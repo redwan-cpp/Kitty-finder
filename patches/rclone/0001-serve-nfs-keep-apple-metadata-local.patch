@@ -1,9 +1,9 @@
 diff --git a/cmd/serve/nfs/applemeta.go b/cmd/serve/nfs/applemeta.go
 new file mode 100644
-index 0000000..b283ca7
+index 0000000..709d512
 --- /dev/null
 +++ b/cmd/serve/nfs/applemeta.go
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,211 @@
 +//go:build unix
 +
 +package nfs
@@ -151,6 +151,28 @@ index 0000000..b283ca7
 +	_ = f.meta.Rename(oldpath, newpath)
 +}
 +
++// removeRemoteMeta removes the Apple metadata files stored on the remote in
++// the directory name, if they are all it contains. Listings hide them, so
++// without this such a directory looks empty but can't be removed. It
++// reports whether anything was removed.
++func (f *FS) removeRemoteMeta(name string) bool {
++	entries, err := f.vfs.ReadDir(name)
++	if err != nil || len(entries) == 0 {
++		return false
++	}
++	for _, e := range entries {
++		if !isAppleMeta(e.Name()) {
++			return false
++		}
++	}
++	for _, e := range entries {
++		if err := f.vfs.Remove(path.Join(name, e.Name())); err != nil {
++			return false
++		}
++	}
++	return true
++}
++
 +// metaForget removes any metadata stored under a removed remote directory.
 +func (f *FS) metaForget(name string) {
 +	if f.meta == nil {
@@ -195,10 +217,10 @@ index 0000000..b283ca7
 +}
 diff --git a/cmd/serve/nfs/applemeta_test.go b/cmd/serve/nfs/applemeta_test.go
 new file mode 100644
-index 0000000..4d8c76c
+index 0000000..879d033
 --- /dev/null
 +++ b/cmd/serve/nfs/applemeta_test.go
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,198 @@
 +//go:build unix
 +
 +package nfs
@@ -350,6 +372,30 @@ index 0000000..4d8c76c
 +	assert.False(t, exists(filepath.Join(metaDir, "moved")))
 +}
 +
++// A folder holding only Apple metadata on the remote (uploaded by some other
++// client) looks empty in listings, so it must also be removable
++func TestAppleMetaRemoveDirWithRemoteMeta(t *testing.T) {
++	bfs, remoteDir, _ := newMetaTestFS(t)
++
++	require.NoError(t, os.MkdirAll(filepath.Join(remoteDir, "dir"), 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, "dir", "._file.txt"), []byte("x"), 0o644))
++	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, "dir", ".DS_Store"), []byte("x"), 0o644))
++	entries, err := bfs.ReadDir("dir")
++	require.NoError(t, err)
++	require.Empty(t, entries)
++
++	require.NoError(t, bfs.Remove("dir"))
++	assert.False(t, exists(filepath.Join(remoteDir, "dir")))
++
++	// Real files still stop a folder being removed
++	require.NoError(t, os.MkdirAll(filepath.Join(remoteDir, "full"), 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, "full", "._a"), []byte("x"), 0o644))
++	require.NoError(t, os.WriteFile(filepath.Join(remoteDir, "full", "keep.txt"), []byte("x"), 0o644))
++	assert.Error(t, bfs.Remove("full"))
++	assert.True(t, exists(filepath.Join(remoteDir, "full", "keep.txt")))
++	assert.True(t, exists(filepath.Join(remoteDir, "full", "._a")))
++}
++
 +func TestAppleMetaDisabled(t *testing.T) {
 +	ctx := t.Context()
 +	remoteDir := t.TempDir()
@@ -374,7 +420,7 @@ index 0000000..4d8c76c
 +	}
 +}
 diff --git a/cmd/serve/nfs/filesystem.go b/cmd/serve/nfs/filesystem.go
-index 2ee8eca..bc2f284 100644
+index 2ee8eca..e845fde 100644
 --- a/cmd/serve/nfs/filesystem.go
 +++ b/cmd/serve/nfs/filesystem.go
 @@ -45,7 +45,8 @@ func setSys(fi os.FileInfo) {
@@ -453,7 +499,7 @@ index 2ee8eca..bc2f284 100644
  	fi, err = f.vfs.Stat(filename)
  	if err != nil {
  		return nil, err
-@@ -115,14 +134,32 @@ func (f *FS) Rename(oldpath, newpath string) (err error) {
+@@ -115,14 +134,35 @@ func (f *FS) Rename(oldpath, newpath string) (err error) {
  	oldpath = f.fullPath(oldpath)
  	newpath = f.fullPath(newpath)
  	defer log.Trace(oldpath, "newpath=%q", newpath)("err=%v", &err)
@@ -481,6 +527,9 @@ index 2ee8eca..bc2f284 100644
 +		return f.meta.Remove(filename)
 +	}
 +	err = f.vfs.Remove(filename)
++	if err != nil && f.meta != nil && f.removeRemoteMeta(filename) {
++		err = f.vfs.Remove(filename)
++	}
 +	if err == nil {
 +		f.metaForget(filename)
 +	}
@@ -488,7 +537,7 @@ index 2ee8eca..bc2f284 100644
  }
  
  // Join joins path elements
-@@ -142,6 +179,9 @@ func (f *FS) TempFile(dir, prefix string) (node billy.File, err error) {
+@@ -142,6 +182,9 @@ func (f *FS) TempFile(dir, prefix string) (node billy.File, err error) {
  func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
  	filename = f.fullPath(filename)
  	defer log.Trace(filename, "perm=%v", perm)("err=%v", &err)
@@ -498,7 +547,7 @@ index 2ee8eca..bc2f284 100644
  	parts := strings.Split(filename, "/")
  	for i := range parts {
  		current := strings.Join(parts[:i+1], "/")
-@@ -160,6 +200,9 @@ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
+@@ -160,6 +203,9 @@ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
  func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
  	filename = f.fullPath(filename)
  	defer log.Trace(filename, "")("fi=%v, err=%v", &fi, &err)
@@ -508,7 +557,7 @@ index 2ee8eca..bc2f284 100644
  	fi, err = f.vfs.Stat(filename)
  	if err != nil {
  		return nil, err
-@@ -172,6 +215,9 @@ func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
+@@ -172,6 +218,9 @@ func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
  func (f *FS) Symlink(target, link string) (err error) {
  	link = f.fullPath(link)
  	defer log.Trace(target, "link=%q", link)("err=%v", &err)
@@ -518,7 +567,7 @@ index 2ee8eca..bc2f284 100644
  	return f.vfs.Symlink(target, link)
  }
  
-@@ -179,6 +225,9 @@ func (f *FS) Symlink(target, link string) (err error) {
+@@ -179,6 +228,9 @@ func (f *FS) Symlink(target, link string) (err error) {
  func (f *FS) Readlink(link string) (result string, err error) {
  	link = f.fullPath(link)
  	defer log.Trace(link, "")("result=%q, err=%v", &result, &err)
@@ -528,7 +577,7 @@ index 2ee8eca..bc2f284 100644
  	return f.vfs.Readlink(link)
  }
  
-@@ -186,6 +235,9 @@ func (f *FS) Readlink(link string) (result string, err error) {
+@@ -186,6 +238,9 @@ func (f *FS) Readlink(link string) (result string, err error) {
  func (f *FS) Chmod(name string, mode os.FileMode) (err error) {
  	name = f.fullPath(name)
  	defer log.Trace(name, "mode=%v", mode)("err=%v", &err)
@@ -538,7 +587,7 @@ index 2ee8eca..bc2f284 100644
  	err = f.vfs.Chmod(name, mode)
  	// Mask Chmod not implemented
  	if err == vfs.ENOSYS {
-@@ -204,6 +256,10 @@ func (f *FS) Lchown(name string, uid, gid int) (err error) {
+@@ -204,6 +259,10 @@ func (f *FS) Lchown(name string, uid, gid int) (err error) {
  func (f *FS) Chown(name string, uid, gid int) (err error) {
  	name = f.fullPath(name)
  	defer log.Trace(name, "uid=%d, gid=%d", uid, gid)("err=%v", &err)
@@ -549,7 +598,7 @@ index 2ee8eca..bc2f284 100644
  	err = f.vfs.Chown(name, uid, gid)
  	// Mask Chown not implemented
  	if err == vfs.ENOSYS {
-@@ -216,6 +272,9 @@ func (f *FS) Chown(name string, uid, gid int) (err error) {
+@@ -216,6 +275,9 @@ func (f *FS) Chown(name string, uid, gid int) (err error) {
  func (f *FS) Chtimes(name string, atime time.Time, mtime time.Time) (err error) {
  	name = f.fullPath(name)
  	defer log.Trace(name, "atime=%v, mtime=%v", atime, mtime)("err=%v", &err)

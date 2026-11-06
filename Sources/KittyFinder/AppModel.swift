@@ -127,17 +127,34 @@ final class AppModel {
 
     /// Stops rclone processes left behind by a previous run that crashed (also from
     /// when the app was called KittyDock) and unmounts any drives they left behind.
+    ///
+    /// Drives are unmounted first, while their engines can still answer; each engine
+    /// then notices and exits by itself. Engines that don't are signalled once (a
+    /// second signal would kill one halfway through unmounting) and then killed.
     private func stopStaleEngines() async {
-        let pkill = Process()
-        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-TERM", "-f", "nfsmount kd-[0-9a-z]+: .*--config .*/Application Support/(Kitty Finder|KittyDock)/rclone\\.conf"]
-        try? pkill.run()
-        pkill.waitUntilExit()
-        if pkill.terminationStatus == 0 { try? await Task.sleep(for: .seconds(2)) }
         let roots = [paths.mountRoot.path + "/", Paths.legacy().mountRoot.path + "/"]
         for mounted in MountTable.mountedPaths() where roots.contains(where: { mounted.hasPrefix($0) }) {
-            MountTable.forceUnmount(mounted)
+            await MountTable.forceUnmount(mounted)
         }
+        let pattern = "nfsmount kd-[0-9a-z]+: .*--config .*/Application Support/(Kitty Finder|KittyDock)/rclone\\.conf"
+        var engines = await Task.detached { Self.pids(matching: pattern) }.value
+        engines = await ProcessWait.untilExited(engines, timeout: 1)
+        for pid in engines { kill(pid, SIGTERM) }
+        engines = await ProcessWait.untilExited(engines, timeout: 10)
+        for pid in engines { kill(pid, SIGKILL) }
+    }
+
+    private nonisolated static func pids(matching pattern: String) -> [pid_t] {
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-f", pattern]
+        let out = Pipe()
+        pgrep.standardOutput = out
+        pgrep.standardError = FileHandle.nullDevice
+        guard (try? pgrep.run()) != nil else { return [] }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        pgrep.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).compactMap { pid_t($0) }
     }
 
     private var cacheLimitPerAccount: Int64 {

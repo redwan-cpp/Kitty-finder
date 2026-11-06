@@ -73,7 +73,7 @@ public enum RemoteArguments {
             "client_id=\(client.id)",
             "client_secret=\(client.secret)",
             "scope=drive",
-            "skip_gdocs=true",
+            "export_formats=webloc",
             "token=\(token)",
             "config_refresh_token=false",
             "config_change_team_drive=false",

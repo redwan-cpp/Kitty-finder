@@ -84,6 +84,23 @@
 - Menu bar icon can be hidden by the notch: app opens a window on first launch and on reopen.
 - Still expected: one keychain prompt per new build (ad-hoc signature). Goes away with Developer ID (Phase 1).
 
+### Speed tuning (2026-11-06, spike/bench.py on the real Drive)
+- Kept: NFS rsize/wsize 1 MB (local throughput 180→1300 MB/s write), dir-cache 1000h +
+  poll 15s + vfs-refresh (freshness 59 s → 35 s), transfers 8 + drive pacer 10 ms/200 + chunk 32M
+  (100 small files uploaded 80 s → 35 s).
+- Dropped: vfs-read-chunk-streams 8 (first bytes 2.6 s → 7 s); write-back 2 s (no measured gain,
+  more cancelled uploads). Large-download throughput varies 36–178 s run to run on this network.
+- Inherent: first open of a file ≈1.3 s, delete ≈1 s/file (Google API latency per request).
+
+### Finder integration (2026-11-06, spike/finder-ops.swift)
+- Fixed: folder copies with symlinks (--links); Google Docs shown as .webloc links so their folders
+  delete; rclone race leaving ghost files after delete/rename mid-upload (patch 0002, with tests that
+  fail before the fix); folders with only remote ._/.DS_Store files now delete (patch 0001).
+- Fixed: app froze on a dead mount (unmounts off the main thread, time-limited); SIGTERM quit
+  deadlock (terminate from inside a main-queue block); stop order now unmount first (umount → -f →
+  diskutil), then signal the engine once — clean quit in 0.3 s even with files open.
+- Not possible over NFS / Drive: Locked flag (chflags), hard links, RENAME_SWAP.
+
 ### Not yet verified
 - By hand in Finder: Quick Look, TextEdit/Preview save, drag-copy, sleep/wake, offline.
 - Launch at login, a second Mac.

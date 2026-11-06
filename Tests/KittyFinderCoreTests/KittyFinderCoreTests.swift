@@ -25,6 +25,35 @@ import Testing
         #expect(!args.contains { $0.contains("rc-pass") || $0.contains("rc-user") || $0.contains("password") })
     }
 
+    @Test func tunedVersusBaseline() {
+        let config = MountConfig(account: account, paths: paths, cacheLimitBytes: 1 << 30, rcPort: 1)
+        let tuned = MountArguments.nfsmount(config)
+        #expect(tuned.contains("rsize=1048576") && tuned.contains("wsize=1048576"))
+        #expect(value(after: "--dir-cache-time", in: tuned) == "1000h")
+        #expect(tuned.contains("--vfs-refresh"))
+        #expect(!tuned.contains("--vfs-read-chunk-streams"), "measured slower: delays a file's first bytes")
+        #expect(value(after: "--vfs-write-back", in: tuned) == "5s")
+        #expect(value(after: "--transfers", in: tuned) == "8")
+        #expect(value(after: "--drive-pacer-min-sleep", in: tuned) == "10ms")
+        // Long listing cache is only safe with change polling on
+        #expect(value(after: "--poll-interval", in: tuned) == "15s")
+
+        let baseline = MountArguments.nfsmount(config, tuning: .baseline, extra: ["--foo"])
+        #expect(!baseline.contains { $0.hasPrefix("rsize=") })
+        #expect(value(after: "--dir-cache-time", in: baseline) == "5m")
+        #expect(!baseline.contains("--vfs-refresh") && !baseline.contains("--vfs-read-chunk-streams"))
+        #expect(value(after: "--vfs-write-back", in: baseline) == "5s")
+        #expect(value(after: "--poll-interval", in: baseline) == "1m")
+        #expect(baseline.last == "--foo")
+        // Safety-critical flags are present either way
+        for args in [tuned, baseline] {
+            #expect(args.contains("locallocks") && args.contains("--nfs-apple-meta-dir"))
+            #expect(args.contains("--links"), "folders with symlinks must copy in")
+            #expect(args.contains("--drive-skip-gdocs=false") && value(after: "--drive-export-formats", in: args) == "webloc")
+            #expect(value(after: "--vfs-cache-mode", in: args) == "full")
+        }
+    }
+
     @Test func environment() {
         let env = MountArguments.environment(configPassword: "pw", rcUser: "u", rcPass: "p")
         #expect(env["RCLONE_CONFIG_PASS"] == "pw")
@@ -94,7 +123,7 @@ import Testing
         let args = RemoteArguments.createDrive(name: "kd-a", client: OAuthClient(id: "id", secret: "s"),
                                                token: "{}", configPath: "/c.conf")
         #expect(Array(args.prefix(4)) == ["config", "create", "kd-a", "drive"])
-        for expected in ["client_id=id", "client_secret=s", "scope=drive", "skip_gdocs=true", "token={}",
+        for expected in ["client_id=id", "client_secret=s", "scope=drive", "export_formats=webloc", "token={}",
                          "config_refresh_token=false", "config_change_team_drive=false", "--non-interactive"] {
             #expect(args.contains(expected), "\(expected)")
         }
@@ -192,6 +221,57 @@ import Testing
         let port = try #require(RemoteControl.freePort())
         #expect(port > 1024)
     }
+}
+
+@Suite struct UnmountTests {
+    @Test func forceUnmountOfUnmountedPathIsImmediate() async {
+        let start = Date()
+        #expect(await MountTable.forceUnmount("/tmp/kitty-finder-not-mounted-\(UUID().uuidString)"))
+        #expect(Date().timeIntervalSince(start) < 1)
+    }
+
+    @Test func processWait() async throws {
+        let quick = Process(), slow = Process()
+        quick.executableURL = URL(fileURLWithPath: "/bin/sleep"); quick.arguments = ["0.2"]
+        slow.executableURL = URL(fileURLWithPath: "/bin/sleep"); slow.arguments = ["30"]
+        try quick.run(); try slow.run()
+        #expect(await ProcessWait.untilExited([quick.processIdentifier], timeout: 5).isEmpty)
+        #expect(await ProcessWait.untilExited([slow.processIdentifier], timeout: 0.3) == [slow.processIdentifier])
+        slow.terminate()
+    }
+
+    /// The real failure: the engine dies and leaves a dead NFS mount behind.
+    /// Needs the patched rclone (scripts/build-rclone.sh); skipped without it.
+    @Test(.enabled(if: FileManager.default.isExecutableFile(atPath: UnmountTests.rclone)))
+    func deadMountIsClearedWithinTimeLimit() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "kf-dead-\(UUID().uuidString)")
+        let remote = dir.appending(path: "remote"), mount = dir.appending(path: "mnt")
+        try FileManager.default.createDirectory(at: remote, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let engine = Process()
+        engine.executableURL = URL(fileURLWithPath: Self.rclone)
+        engine.arguments = ["nfsmount", remote.path, mount.path, "--config", "/dev/null", "-o", "locallocks",
+                            "--vfs-cache-mode", "full", "--cache-dir", dir.appending(path: "cache").path]
+        engine.standardOutput = FileHandle.nullDevice
+        engine.standardError = FileHandle.nullDevice
+        try engine.run()
+        // Deliberately the /var/… form: isMounted must still match the table's /private/var/…
+        let path = mount.path
+        for _ in 0..<50 where !MountTable.isMounted(path) { try await Task.sleep(for: .milliseconds(100)) }
+        try #require(MountTable.isMounted(path), "engine didn't mount")
+
+        kill(engine.processIdentifier, SIGKILL) // dies without unmounting
+        let start = Date()
+        let cleared = await MountTable.forceUnmount(path, timeout: 10)
+        #expect(Date().timeIntervalSince(start) < 12, "must give up within its time limit")
+        #expect(cleared && !MountTable.isMounted(path))
+    }
+
+    static let rclone = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appending(path: "build/rclone").path
 }
 
 @Suite struct ProcessTests {

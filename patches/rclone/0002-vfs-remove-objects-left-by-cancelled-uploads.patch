@@ -1,0 +1,138 @@
+diff --git a/vfs/file.go b/vfs/file.go
+index 11d63d8..35b6c96 100644
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -277,6 +277,15 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+ 			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
+ 				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
+ 			}
++			// Renaming cancels any upload in progress, which may have
++			// stored the object under the old name without returning it
++			if o == nil {
++				if stale, err := d.Fs().NewObject(ctx, oldPath); err == nil {
++					if err := stale.Remove(ctx); err != nil {
++						fs.Errorf(oldPath, "File.Rename: failed to remove object left by cancelled upload: %v", err)
++					}
++				}
++			}
+ 		}
+ 		// Update the node with the new details
+ 		fs.Debugf(f.Path(), "Updating file with %v %p", newObject, f)
+@@ -678,8 +687,14 @@ func (f *File) Remove() (err error) {
+ 
+ 	f.muRW.Lock() // muRW must be locked before mu to avoid
+ 	f.mu.Lock()   // deadlock in RWFileHandle.openPending and .close
+-	if f.o != nil {
+-		err = f.o.Remove(f.ctx)
++	o := f.o
++	if o == nil && wasWriting {
++		// The cancelled upload may have stored the object without
++		// returning it, so look for it
++		o, _ = d.Fs().NewObject(f.ctx, f._cachePath())
++	}
++	if o != nil {
++		err = o.Remove(f.ctx)
+ 	}
+ 	f.mu.Unlock()
+ 	f.muRW.Unlock()
+diff --git a/vfs/file_cancel_test.go b/vfs/file_cancel_test.go
+new file mode 100644
+index 0000000..a40990e
+--- /dev/null
++++ b/vfs/file_cancel_test.go
+@@ -0,0 +1,95 @@
++package vfs
++
++import (
++	"context"
++	"io"
++	"os"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fstest"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// cancelAfterPutFs stores the first upload and then reports it as
++// cancelled without returning the object, like a cloud backend where
++// the upload completes on the server just as the client cancels it.
++type cancelAfterPutFs struct {
++	fs.Fs
++	puts    atomic.Int32
++	putting chan struct{}
++}
++
++// Features disables partial uploads so objects are written under their
++// final name, as on backends such as Google Drive.
++func (f *cancelAfterPutFs) Features() *fs.Features {
++	features := *f.Fs.Features()
++	features.PartialUploads = false
++	return &features
++}
++
++func (f *cancelAfterPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
++	if f.puts.Add(1) > 1 {
++		return f.Fs.Put(ctx, in, src, options...)
++	}
++	if _, err := f.Fs.Put(context.Background(), in, src, options...); err != nil {
++		return nil, err
++	}
++	close(f.putting)
++	<-ctx.Done()
++	return nil, ctx.Err()
++}
++
++// newCancelAfterPutVFS returns a VFS whose first upload is stored and
++// then cancelled, with "file1" written and its upload in progress.
++func newCancelAfterPutVFS(t *testing.T) (*fstest.Run, *VFS) {
++	r := fstest.NewRun(t)
++	f := &cancelAfterPutFs{Fs: r.Fremote, putting: make(chan struct{})}
++	opt := vfscommon.Opt
++	opt.CacheMode = vfscommon.CacheModeFull
++	opt.WriteBack = fs.Duration(10 * time.Millisecond)
++	vfs := New(context.Background(), f, &opt)
++	t.Cleanup(func() { cleanupVFS(t, vfs) })
++
++	fd, err := vfs.OpenFile("file1", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o777)
++	require.NoError(t, err)
++	_, err = fd.Write([]byte("contents"))
++	require.NoError(t, err)
++	require.NoError(t, fd.Close())
++	select {
++	case <-f.putting:
++	case <-time.After(10 * time.Second):
++		t.Fatal("upload didn't start")
++	}
++	return r, vfs
++}
++
++// Removing a file whose upload is cancelled must not leave the object behind
++func TestFileRemoveCancelledUpload(t *testing.T) {
++	r, vfs := newCancelAfterPutVFS(t)
++	_, err := r.Fremote.NewObject(context.Background(), "file1")
++	require.NoError(t, err, "upload should have stored the object")
++
++	require.NoError(t, vfs.Remove("file1"))
++
++	_, err = r.Fremote.NewObject(context.Background(), "file1")
++	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
++}
++
++// Renaming a file whose upload is cancelled must not leave the object behind under the old name
++func TestFileRenameCancelledUpload(t *testing.T) {
++	r, vfs := newCancelAfterPutVFS(t)
++
++	require.NoError(t, vfs.Rename("file1", "file2"))
++	vfs.WaitForWriters(10 * time.Second)
++
++	ctx := context.Background()
++	_, err := r.Fremote.NewObject(ctx, "file1")
++	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
++	_, err = r.Fremote.NewObject(ctx, "file2")
++	assert.NoError(t, err)
++}

@@ -1,0 +1,17 @@
+{
+ "browse drive root, cold": 0.5813153749913909,
+ "browse drive root, warm": 0.0004750420048367232,
+ "browse 100-file folder, cold": 1.042458625001018,
+ "browse 100-file folder, warm": 0.0014728329988429323,
+ "open 20 small files, cold": 28.837526666990016,
+ "open 20 small files, warm": 0.007128875004127622,
+ "64 MB file: first bytes, cold": 7.0106560830026865,
+ "64 MB file: full read, cold": 68.36544095800491,
+ "64 MB file: full read, warm": 0.0182858330081217,
+ "copy in 100 small files (Finder done)": 3.3723351250082487,
+ "copy in 100 small files (uploaded)": 35.44327975001943,
+ "copy in 64 MB file (Finder done)": 1.2673582090064883,
+ "copy in 64 MB file (uploaded)": 17.386014584015356,
+ "rename folder of 100 files": 1.4834275419998448,
+ "delete 100 files": 106.5583751660015
+}

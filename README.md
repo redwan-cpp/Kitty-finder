@@ -36,9 +36,32 @@ Kitty Finder is a menu bar app that runs a bundled, patched copy of
 - `-o locallocks` is required: rclone's NFS server has no lock manager, and
   without local locking macOS can't store extended attributes, so Finder
   copies fail with "Operation not permitted".
-- The patch (`patches/rclone/`) adds `--nfs-apple-meta-dir`, which keeps
+- Patch 0001 (`patches/rclone/`) adds `--nfs-apple-meta-dir`, which keeps
   macOS `._*` (AppleDouble) and `.DS_Store` files on the Mac instead of
-  uploading them next to every file in Drive.
+  uploading them next to every file in Drive. Folders that hold only such
+  files on Drive (uploaded by other tools) can still be deleted.
+- Patch 0002 fixes an rclone race: deleting or renaming a file while its upload
+  was being cancelled left a ghost copy on Google Drive (which also blocked
+  deleting its folder).
+- Google Docs, Sheets and Slides appear as `.webloc` links that open in the
+  browser, and symlinks are stored as small `.rclonelink` files (`--links`).
+
+### What works in Finder
+
+Browse, open, Quick Look, save from apps (including safe-save), edit in place,
+copy in from the Mac (folders with symlinks too), duplicate, rename, move,
+delete (files and folders), Finder tags, dates. Not possible on a network
+drive / Google Drive: the **Locked** checkbox, hard links, and "swap" saves
+(apps fall back to a normal save). `spike/finder-ops.swift` checks all of these.
+
+### Speed
+
+Measured on a real Drive with `spike/bench.py` (results in `spike/bench-*.json`):
+uploads of many files 2.2× faster than rclone's defaults, folders open
+instantly once listed, changes made elsewhere appear in ~35 s (was ~60 s), and
+Finder↔mount transfers up to 7× faster (1 MB NFS transfer size). Opening a file
+for the first time takes about a second (Google's response time); deleting is
+about a second per file (one Google request each).
 
 State on disk:
 

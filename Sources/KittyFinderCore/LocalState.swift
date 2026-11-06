@@ -5,7 +5,16 @@ import Security
 /// NFS server can't hang the caller.
 public enum MountTable {
     public static func isMounted(_ path: String) -> Bool {
-        mountedPaths().contains(URL(fileURLWithPath: path).standardizedFileURL.path)
+        let mounted = mountedPaths()
+        let trimmed = path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+        if mounted.contains(trimmed) { return true }
+        // The table has real paths (/tmp and /var live under /private). Resolve only the
+        // parent: resolving the mount point itself would touch the mount and could hang.
+        let url = URL(fileURLWithPath: trimmed)
+        guard let parent = realpath(url.deletingLastPathComponent().path, nil) else { return false }
+        defer { free(parent) }
+        let real = String(cString: parent)
+        return mounted.contains((real == "/" ? "" : real) + "/" + url.lastPathComponent)
     }
 
     public static func mountedPaths() -> Set<String> {
@@ -23,17 +32,47 @@ public enum MountTable {
         return paths
     }
 
-    /// Force-unmounts a stale mount (for example after rclone crashed).
+    /// Unmounts `path`, forcibly if needed, and reports whether it is unmounted afterwards.
+    ///
+    /// Tries a plain `umount`, then `umount -f` (the kernel drops the mount at once,
+    /// even if its server is gone), then `diskutil unmount force`. Unmounting NFS can
+    /// block indefinitely, so this never waits longer than `timeout`; a command that is
+    /// still blocked is left to finish on its own.
     @discardableResult
-    public static func forceUnmount(_ path: String) -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-        p.arguments = ["unmount", "force", path]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return false }
-        p.waitUntilExit()
-        return p.terminationStatus == 0
+    public static func forceUnmount(_ path: String, timeout: TimeInterval = 10) async -> Bool {
+        for command in [["/sbin/umount"], ["/sbin/umount", "-f"], ["/usr/sbin/diskutil", "unmount", "force"]] {
+            guard isMounted(path) else { return true }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: command[0])
+            p.arguments = Array(command.dropFirst()) + [path]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            do { try p.run() } catch { continue }
+            let deadline = Date().addingTimeInterval(timeout / 3)
+            while p.isRunning && isMounted(path) && Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+        return !isMounted(path)
+    }
+}
+
+/// Waits for processes to exit, without blocking a thread.
+public enum ProcessWait {
+    /// True if `pid` is still running.
+    public static func isAlive(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    /// Waits until none of `pids` is running, or `timeout` passes. Returns the ones still running.
+    public static func untilExited(_ pids: [pid_t], timeout: TimeInterval) async -> [pid_t] {
+        let deadline = Date().addingTimeInterval(timeout)
+        var alive = pids.filter(isAlive)
+        while !alive.isEmpty && Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(200))
+            alive = alive.filter(isAlive)
+        }
+        return alive
     }
 }
 

@@ -49,7 +49,8 @@ struct MenuContent: View {
             HStack {
                 Button("Settings…") { model.openSettingsHandler?() }
                 Spacer()
-                Button("Quit Kitty Finder") { NSApp.terminate(nil) }
+                // On the next run-loop turn, so quitting can wait for drives to stop
+                Button("Quit Kitty Finder") { RunLoop.main.perform { NSApp.terminate(nil) } }
             }
         }
         .buttonStyle(.borderless)
