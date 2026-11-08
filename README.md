@@ -70,6 +70,8 @@ Kitty Finder is a SwiftUI/AppKit menu bar app that runs a bundled copy of
     downloaded fail at once and folders are listed from the cache.
   - **0004** saves Google Drive's root folder ID in the config, so a drive can
     start with no internet connection.
+  - **0005** adds `--vfs-pin`, so offline folders are pinned before rclone's
+    first cache clean-up at startup.
 - Settings are measured, not guessed: `spike/bench.py` benchmarks a real
   drive (results in `spike/bench-*.json`). Compared with rclone's defaults,
   uploading many files is 2.2× faster, folders open instantly once listed,

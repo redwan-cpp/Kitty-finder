@@ -8,6 +8,8 @@ public struct VFSStats: Decodable, Equatable, Sendable {
     public var outOfSpace: Bool = false
     public var uploadsInProgress: Int = 0
     public var uploadsQueued: Int = 0
+    /// The folder where the engine keeps a record of each cached file.
+    public var metaPath: String?
 
     public var pendingUploads: Int { uploadsInProgress + uploadsQueued }
 
@@ -16,6 +18,7 @@ public struct VFSStats: Decodable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey { case diskCache }
     enum DiskKeys: String, CodingKey {
         case bytesUsed, files, erroredFiles, outOfSpace, uploadsInProgress, uploadsQueued
+        case metaPath = "pathMeta"
     }
 
     public init(from decoder: Decoder) throws {
@@ -28,6 +31,7 @@ public struct VFSStats: Decodable, Equatable, Sendable {
         outOfSpace = try d.decodeIfPresent(Bool.self, forKey: .outOfSpace) ?? false
         uploadsInProgress = try d.decodeIfPresent(Int.self, forKey: .uploadsInProgress) ?? 0
         uploadsQueued = try d.decodeIfPresent(Int.self, forKey: .uploadsQueued) ?? 0
+        metaPath = try d.decodeIfPresent(String.self, forKey: .metaPath)
     }
 }
 

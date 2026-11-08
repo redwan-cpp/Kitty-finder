@@ -134,3 +134,27 @@
   uploaded 13 s after reconnecting. First run failed (no root ID offline) → patch 0004.
 - Finder needed a relaunch to show the new Services entries the first time.
 - Updater: tested end to end after the v0.2.0 release (an 0.1.9 build updating itself).
+
+## v0.2.1 — offline folders survive restarts (2026-11-08)
+- [x] Bug (found by the patch 0003 review): pins lived only in memory and rclone's cache
+      cleaner runs as soon as the cache is created, so at every restart pinned files older
+      than the age limit, or over the space limit, were cleared before the app re-pinned them.
+      The app's manifest still listed them, so they never came back.
+- [x] Patch 0005: `--vfs-pin` (repeatable) pins before the cleaner starts. Go test
+      `TestVFSPinOptionSurvivesStartupClean` failed before the fix (pinned file purged).
+      `vfs.go` compares options with reflect.DeepEqual (a slice field isn't comparable).
+- [x] App passes `--vfs-pin=<folder>` for each offline folder when a drive starts.
+- [x] Offline sync also checks the engine's own record (`vfs/stats` pathMeta → vfsMeta
+      JSON ranges + fingerprint) and downloads files that are no longer fully cached.
+
+### Review
+- 41 unit tests; rclone vfs, vfscache, nfs, mountlib and drive tests pass.
+- Live on the real Drive: engine started with `--vfs-pin=kd-pin-test`; two files deleted
+  from the cache while stopped were downloaded again in full at the next start.
+
+### Found, not fixed yet
+- rclone names each cache folder after a hash of the Drive flags (`kd-<id>{C3LU_}`).
+  Changing those flags (the Google Docs setting, or new tuning in an update) switches to a
+  new, empty cache folder: the old one is never cleared or counted, offline folders download
+  again, and edits that hadn't uploaded are left behind in it. This Mac already has 674 MB
+  orphaned from tuning changes on 2026-11-06 (no unuploaded edits in it).

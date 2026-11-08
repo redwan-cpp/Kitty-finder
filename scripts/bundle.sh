@@ -6,7 +6,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-VERSION="${VERSION:-0.2.0}"
+VERSION="${VERSION:-0.2.1}"
 # GitHub repository the in-app updater checks (forks: change this)
 UPDATE_REPOSITORY="${UPDATE_REPOSITORY:-redwan-cpp/Kitty-finder}"
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"

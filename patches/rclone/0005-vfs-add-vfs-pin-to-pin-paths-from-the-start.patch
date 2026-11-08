@@ -1,0 +1,108 @@
+vfs: add --vfs-pin to pin paths from the start
+
+Pins added with vfs/pin are kept in memory, and the cache cleaner runs
+as soon as the cache is created, so after a restart it could remove
+pinned files (older than --vfs-cache-max-age, or over
+--vfs-cache-max-size) before they were pinned again. --vfs-pin, which
+can be repeated, pins paths before the cleaner starts.
+
+diff --git a/vfs/offline_test.go b/vfs/offline_test.go
+index f91ae75..d7d7ff1 100644
+--- a/vfs/offline_test.go
++++ b/vfs/offline_test.go
+@@ -87,6 +87,34 @@ func newRestartedOfflineVFS(t *testing.T) (*fstest.Run, *unreachableFs, *VFS) {
+ 	return r, f, vfs
+ }
+ 
++// Pins given in the options protect files from the clean-up at startup
++func TestVFSPinOptionSurvivesStartupClean(t *testing.T) {
++	ctx := context.Background()
++	r := fstest.NewRun(t)
++	opt := offlineTestOpt()
++	r.WriteObject(ctx, "pinned/file", "pinned contents", t1)
++	r.WriteObject(ctx, "other/file", "other contents", t1)
++
++	vfs := New(ctx, r.Fremote, &opt)
++	for _, name := range []string{"pinned/file", "other/file"} {
++		_, err := vfs.ReadFile(name)
++		require.NoError(t, err)
++	}
++	vfs.WaitForWriters(waitForWritersDelay)
++	vfs.Shutdown()
++	time.Sleep(10 * time.Millisecond)
++
++	// Everything is older than the max age, so the startup clean removes
++	// every item that isn't pinned
++	opt.CacheMaxAge = fs.Duration(time.Millisecond)
++	opt.Pin = []string{"pinned"}
++	vfs = New(ctx, r.Fremote, &opt)
++	t.Cleanup(func() { cleanupVFS(t, vfs) })
++	require.Eventually(t, func() bool { return !vfs.cache.Exists("other/file") }, 5*time.Second, 10*time.Millisecond)
++	assert.True(t, vfs.cache.Exists("pinned/file"))
++	assert.Equal(t, []string{"pinned"}, vfs.cache.Pins())
++}
++
+ // A directory never listed shows its cached files while offline
+ func TestVFSOfflineAfterRestart(t *testing.T) {
+ 	_, _, vfs := newRestartedOfflineVFS(t)
+diff --git a/vfs/vfs.go b/vfs/vfs.go
+index 6c0cb7d..84401dd 100644
+--- a/vfs/vfs.go
++++ b/vfs/vfs.go
+@@ -33,6 +33,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"reflect"
+ 	"slices"
+ 
+ 	"github.com/go-git/go-billy/v5"
+@@ -236,7 +237,7 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
+ 	for _, activeVFS := range active[configName] {
+ 		// A VFS whose last reference has gone is being shut down
+ 		// but may not have removed itself from the cache yet.
+-		if vfs.Opt == activeVFS.Opt && activeVFS.Hold() {
++		if reflect.DeepEqual(vfs.Opt, activeVFS.Opt) && activeVFS.Hold() {
+ 			fs.Debugf(f, "Reusing VFS from active cache")
+ 			cancel()
+ 			return activeVFS
+diff --git a/vfs/vfscache/cache.go b/vfs/vfscache/cache.go
+index 9cb2185..5beef9e 100644
+--- a/vfs/vfscache/cache.go
++++ b/vfs/vfscache/cache.go
+@@ -138,6 +138,11 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
+ 		pins:       make(map[string]struct{}),
+ 	}
+ 
++	// Pin before the cleaner starts, as its first run is straight away
++	for _, name := range opt.Pin {
++		c.Pin(name)
++	}
++
+ 	// load in the cache and metadata off disk
+ 	err = c.reload(ctx)
+ 	if err != nil {
+diff --git a/vfs/vfscommon/options.go b/vfs/vfscommon/options.go
+index 927fff6..27a64d5 100644
+--- a/vfs/vfscommon/options.go
++++ b/vfs/vfscommon/options.go
+@@ -75,6 +75,11 @@ var OptionsInfo = fs.Options{{
+ 	Default: fs.SizeSuffix(-1),
+ 	Help:    "Target minimum free space on the disk containing the cache",
+ 	Groups:  "VFS",
++}, {
++	Name:    "vfs_pin",
++	Default: []string{},
++	Help:    "Pin a directory or file so the cache cleaner never removes it (can be repeated)",
++	Groups:  "VFS",
+ }, {
+ 	Name:    "vfs_read_chunk_size",
+ 	Default: 128 * fs.Mebi,
+@@ -204,6 +209,7 @@ type Options struct {
+ 	CacheMaxAge        fs.Duration   `config:"vfs_cache_max_age"`
+ 	CacheMaxSize       fs.SizeSuffix `config:"vfs_cache_max_size"`
+ 	CacheMinFreeSpace  fs.SizeSuffix `config:"vfs_cache_min_free_space"`
++	Pin                []string      `config:"vfs_pin"` // paths pinned from the start, as by vfs/pin
+ 	CachePollInterval  fs.Duration   `config:"vfs_cache_poll_interval"`
+ 	CaseInsensitive    bool          `config:"vfs_case_insensitive"`
+ 	BlockNormDupes     bool          `config:"vfs_block_norm_dupes"`

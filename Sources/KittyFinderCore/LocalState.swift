@@ -104,6 +104,28 @@ public enum CacheInspector {
         }
         return false
     }
+
+    /// True if the engine holds all of a drive file (`path`, drive-relative) on this
+    /// Mac, according to its record in `metaRoot` (the engine's `pathMeta`).
+    public static func isFullyCached(_ path: String, metaRoot: URL) -> Bool {
+        struct Meta: Decodable {
+            struct Range: Decodable { let Pos: Int64; let Size: Int64 }
+            let Size: Int64
+            let Rs: [Range]?
+            let Fingerprint: String?
+            let Dirty: Bool?
+        }
+        guard let data = try? Data(contentsOf: metaRoot.appending(path: path)),
+              let meta = try? JSONDecoder().decode(Meta.self, from: data) else { return false }
+        // Without a fingerprint or local edits, the record is a placeholder with no data
+        guard meta.Dirty == true || !(meta.Fingerprint ?? "").isEmpty else { return false }
+        var covered: Int64 = 0
+        for range in (meta.Rs ?? []).sorted(by: { $0.Pos < $1.Pos }) {
+            if range.Pos > covered { return false }
+            covered = max(covered, range.Pos + range.Size)
+        }
+        return covered >= meta.Size
+    }
 }
 
 public enum KeychainLookup: Equatable, Sendable {

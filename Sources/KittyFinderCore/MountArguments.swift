@@ -11,8 +11,10 @@ public struct MountConfig: Equatable, Sendable {
     public var volumeName: String
     public var cacheLimitBytes: Int64
     public var rcPort: Int
+    /// Offline folders (drive-relative), pinned before the engine first clears its cache.
+    public var pinnedFolders: [String]
 
-    public init(account: Account, paths: Paths, cacheLimitBytes: Int64, rcPort: Int) {
+    public init(account: Account, paths: Paths, cacheLimitBytes: Int64, rcPort: Int, pinnedFolders: [String] = []) {
         remoteName = account.remoteName
         mountPath = account.mountPath(in: paths).path
         configPath = paths.rcloneConfig.path
@@ -22,6 +24,7 @@ public struct MountConfig: Equatable, Sendable {
         volumeName = account.title
         self.cacheLimitBytes = cacheLimitBytes
         self.rcPort = rcPort
+        self.pinnedFolders = pinnedFolders
     }
 }
 
@@ -142,7 +145,10 @@ public enum MountArguments {
             // a minute instead of rclone's default five, so the drive doesn't hang that long.
             "--contimeout", "15s",
             "--timeout", "1m",
-        ] + tuning.arguments + options.arguments + extra
+        ]
+        // "=" keeps a folder whose name starts with "-", or the whole drive (""), one argument
+        + c.pinnedFolders.map { "--vfs-pin=\($0)" }
+        + tuning.arguments + options.arguments + extra
     }
 
     /// Environment for any rclone call. `rcUser`/`rcPass` are only needed for mounts.

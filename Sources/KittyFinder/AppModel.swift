@@ -225,6 +225,7 @@ final class AppModel {
 
     private func makeController(for account: Account) -> MountController {
         let controller = MountController(account: account, paths: paths, rclone: rclone!)
+        controller.offlineFolders = account.offlineFolders
         let id = account.id
         controller.onMounted = { [weak self] in self?.driveMounted(id) }
         controller.onProblem = { [weak self] message in self?.driveProblem(id, message) }
@@ -513,6 +514,13 @@ final class AppModel {
     /// Downloads new and changed files in an account's offline folders.
     func syncOffline(_ id: String) {
         guard let account = account(id), let controller = mounts[id], let sync = offlineSyncs[id] else { return }
+        Task {
+            let metaRoot = await controller.cacheMetaRoot()
+            runOfflineSync(account, controller, sync, metaRoot: metaRoot)
+        }
+    }
+
+    private func runOfflineSync(_ account: Account, _ controller: MountController, _ sync: OfflineSync, metaRoot: URL?) {
         let blocked: OfflineSync.Status?
         if !controller.supportsOffline {
             blocked = .failed(Self.offlineUnsupported)
@@ -524,7 +532,8 @@ final class AppModel {
             blocked = nil
         }
         sync.run(folders: account.offlineFolders, root: account.mountPath(in: paths), blocked: blocked,
-                 keepFreeBytes: Int64(settings.keepFreeGB) * 1_073_741_824, cacheVolume: paths.appSupport)
+                 keepFreeBytes: Int64(settings.keepFreeGB) * 1_073_741_824, cacheVolume: paths.appSupport,
+                 metaRoot: metaRoot)
     }
 
     func syncAllOffline() {

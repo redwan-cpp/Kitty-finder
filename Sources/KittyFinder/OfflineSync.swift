@@ -27,8 +27,9 @@ final class OfflineSync {
     init(manifestFile: URL) { self.manifestFile = manifestFile }
 
     /// Brings `folders` up to date. With `blocked` set, nothing downloads and
-    /// folders that aren't ready yet show it as the reason.
-    func run(folders: [String], root: URL, blocked: Status?, keepFreeBytes: Int64, cacheVolume: URL) {
+    /// folders that aren't ready yet show it as the reason. `metaRoot` is the
+    /// engine's record of cached files: files missing from it download again.
+    func run(folders: [String], root: URL, blocked: Status?, keepFreeBytes: Int64, cacheVolume: URL, metaRoot: URL?) {
         cancel()
         let gen = generation
         for folder in Array(status.keys) where !folders.contains(folder) {
@@ -47,7 +48,7 @@ final class OfflineSync {
         }
         task = Task.detached(priority: .utility) {
             await Self.work(folders: folders, root: root, keepFreeBytes: keepFreeBytes, cacheVolume: cacheVolume,
-                            manifestFile: manifestFile, report: report)
+                            metaRoot: metaRoot, manifestFile: manifestFile, report: report)
         }
     }
 
@@ -71,7 +72,8 @@ final class OfflineSync {
         if let size { bytes[folder] = size }
     }
 
-    private nonisolated static func work(folders: [String], root: URL, keepFreeBytes: Int64, cacheVolume: URL, manifestFile: URL,
+    private nonisolated static func work(folders: [String], root: URL, keepFreeBytes: Int64, cacheVolume: URL, metaRoot: URL?,
+                                         manifestFile: URL,
                                          report: @escaping @Sendable (String, Status, Int64?) async -> Void) async {
         let file = JSONFile<OfflineManifest>(manifestFile)
         var manifest = (try? file.load()) ?? OfflineManifest()
@@ -87,7 +89,13 @@ final class OfflineSync {
                 manifest.files[key] = nil
             }
             let size = current.values.reduce(Int64(0)) { $0 + $1.size }
-            let changed = manifest.changed(in: current)
+            var changed = manifest.changed(in: current)
+            // Files the engine no longer holds (cleared, or in a cache it stopped using)
+            if let metaRoot {
+                let unchanged = Set(current.keys).subtracting(changed)
+                let missing = await onQueue { unchanged.filter { !CacheInspector.isFullyCached($0, metaRoot: metaRoot) } }
+                changed = (changed + missing).sorted()
+            }
             if changed.isEmpty {
                 await report(folder, .upToDate, size)
                 continue

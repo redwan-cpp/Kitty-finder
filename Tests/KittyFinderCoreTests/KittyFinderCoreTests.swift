@@ -21,6 +21,7 @@ import Testing
         #expect(value(after: "--cache-dir", in: args) == "/Users/test/Library/Application Support/Kitty Finder/cache/abc123")
         #expect(value(after: "--rc-addr", in: args) == "127.0.0.1:5599")
         #expect(value(after: "--volname", in: args) == "Google Drive (me@example.com)")
+        #expect(!args.contains { $0.hasPrefix("--vfs-pin") }, "no offline folders, no pins")
         // A stalled request (e.g. right after Wi-Fi reconnects) must not hang a drive for rclone's default 5 minutes
         #expect(value(after: "--timeout", in: args) == "1m")
         #expect(value(after: "--contimeout", in: args) == "15s")
@@ -119,6 +120,7 @@ import Testing
         #expect(stats.files == 3)
         #expect(stats.erroredFiles == 1)
         #expect(stats.pendingUploads == 3)
+        #expect(stats.metaPath == "/y", "where the engine keeps its cache records, to check offline files")
         #expect(try JSONDecoder().decode(VFSStats.self, from: Data("{}".utf8)) == VFSStats())
     }
 
@@ -480,5 +482,41 @@ final class Seen: @unchecked Sendable {
         #expect(url.absoluteString.hasPrefix("https://github.com/owner/repo/issues/new?body="))
         let body = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value ?? ""
         #expect(body.contains("Kitty Finder 0.2.0 · macOS 15.1 · engine v1.75.2"))
+    }
+}
+
+@Suite struct OfflineCacheTests {
+    let account = Account(id: "abc123", provider: .googleDrive, email: "me@example.com")
+    let paths = Paths(home: URL(fileURLWithPath: "/Users/test"))
+
+    @Test func offlineFoldersArePinnedFromTheStart() {
+        // The engine clears its cache as soon as it starts, so pins must be in its arguments
+        let config = MountConfig(account: account, paths: paths, cacheLimitBytes: 1 << 30, rcPort: 1,
+                                 pinnedFolders: ["Work/Taxes", "-odd name", ""])
+        let args = MountArguments.nfsmount(config)
+        #expect(args.filter { $0.hasPrefix("--vfs-pin") } == ["--vfs-pin=Work/Taxes", "--vfs-pin=-odd name", "--vfs-pin="])
+    }
+
+    @Test func fullyCachedFiles() throws {
+        let meta = FileManager.default.temporaryDirectory.appending(path: "kf-meta-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: meta) }
+        func write(_ path: String, _ json: String) throws {
+            let url = meta.appending(path: path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(json.utf8).write(to: url)
+        }
+        try write("a/whole.txt", #"{"Size":10,"Rs":[{"Pos":0,"Size":4},{"Pos":4,"Size":6}],"Fingerprint":"f","Dirty":false}"#)
+        try write("a/part.txt", #"{"Size":10,"Rs":[{"Pos":0,"Size":4}],"Fingerprint":"f","Dirty":false}"#)
+        try write("a/gap.txt", #"{"Size":10,"Rs":[{"Pos":0,"Size":4},{"Pos":5,"Size":5}],"Fingerprint":"f"}"#)
+        try write("a/empty.txt", #"{"Size":0,"Rs":[],"Fingerprint":"f"}"#)
+        try write("a/placeholder.txt", #"{"Size":0,"Rs":[],"Fingerprint":""}"#)
+        try write("a/edited.txt", #"{"Size":3,"Rs":[{"Pos":0,"Size":3}],"Fingerprint":"","Dirty":true}"#)
+        #expect(CacheInspector.isFullyCached("a/whole.txt", metaRoot: meta))
+        #expect(!CacheInspector.isFullyCached("a/part.txt", metaRoot: meta))
+        #expect(!CacheInspector.isFullyCached("a/gap.txt", metaRoot: meta))
+        #expect(CacheInspector.isFullyCached("a/empty.txt", metaRoot: meta))
+        #expect(!CacheInspector.isFullyCached("a/placeholder.txt", metaRoot: meta), "an entry with no data yet")
+        #expect(CacheInspector.isFullyCached("a/edited.txt", metaRoot: meta))
+        #expect(!CacheInspector.isFullyCached("a/missing.txt", metaRoot: meta))
     }
 }

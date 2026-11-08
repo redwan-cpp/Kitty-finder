@@ -34,6 +34,9 @@ final class MountController {
     @ObservationIgnored var onProblem: ((String) -> Void)?
     /// False once the engine has said it can't keep folders offline (an older engine).
     private(set) var supportsOffline = true
+    /// Offline folders, pinned as the engine starts (it clears its cache at once,
+    /// before they could be pinned over remote control).
+    var offlineFolders: [String] = []
 
     init(account: Account, paths: Paths, rclone: Rclone) {
         self.account = account
@@ -134,7 +137,8 @@ final class MountController {
             return
         }
         let rc = RemoteControl(port: port)
-        let config = MountConfig(account: account, paths: paths, cacheLimitBytes: cacheLimitBytes, rcPort: port)
+        let config = MountConfig(account: account, paths: paths, cacheLimitBytes: cacheLimitBytes, rcPort: port,
+                                 pinnedFolders: offlineFolders)
 
         let process = Process()
         process.executableURL = rclone.binary
@@ -219,6 +223,7 @@ final class MountController {
 
     /// Makes the engine keep exactly `folders` downloaded (drive-relative paths).
     func applyOfflineFolders(_ folders: [String]) async {
+        offlineFolders = folders
         guard let rc = remoteControl, supportsOffline else { return }
         do {
             let current = Set(try await rc.pins())
@@ -229,6 +234,13 @@ final class MountController {
         } catch {
             NSLog("Kitty Finder: offline folders: \(error.localizedDescription)")
         }
+    }
+
+    /// Where the engine keeps its record of each cached file, once it's running.
+    func cacheMetaRoot() async -> URL? {
+        if let path = stats?.metaPath { return URL(fileURLWithPath: path, isDirectory: true) }
+        guard let path = try? await remoteControl?.vfsStats().metaPath else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
     }
 
     /// Tells the engine whether the Mac is offline.
