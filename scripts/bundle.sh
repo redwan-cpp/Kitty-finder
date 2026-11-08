@@ -2,6 +2,7 @@
 # Build "build/Kitty Finder.app": universal app binary + patched rclone + icon, ad-hoc signed.
 # Put your Google OAuth client in Config/GoogleOAuth.plist to build it in
 # (see Config/GoogleOAuth.example.plist); otherwise people enter one in Settings.
+# NO_GOOGLE_CLIENT=1 leaves it out even if present, for public releases.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -23,7 +24,9 @@ lipo -create -output "$APP/Contents/MacOS/KittyFinder" \
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp build/rclone "$APP/Contents/Resources/rclone"
 cp build/rclone-COPYING "$APP/Contents/Resources/rclone-COPYING"
-if [ -f Config/GoogleOAuth.plist ]; then
+if [ "${NO_GOOGLE_CLIENT:-}" = "1" ]; then
+  echo "note: NO_GOOGLE_CLIENT=1, so no Google client is built in; users enter one in Settings"
+elif [ -f Config/GoogleOAuth.plist ]; then
   cp Config/GoogleOAuth.plist "$APP/Contents/Resources/GoogleOAuth.plist"
   echo "bundled Google OAuth client from Config/GoogleOAuth.plist"
 else
