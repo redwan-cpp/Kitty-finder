@@ -21,6 +21,9 @@ import Testing
         #expect(value(after: "--cache-dir", in: args) == "/Users/test/Library/Application Support/Kitty Finder/cache/abc123")
         #expect(value(after: "--rc-addr", in: args) == "127.0.0.1:5599")
         #expect(value(after: "--volname", in: args) == "Google Drive (me@example.com)")
+        // A stalled request (e.g. right after Wi-Fi reconnects) must not hang a drive for rclone's default 5 minutes
+        #expect(value(after: "--timeout", in: args) == "1m")
+        #expect(value(after: "--contimeout", in: args) == "15s")
         // Secrets travel in the environment, never in arguments
         #expect(!args.contains { $0.contains("rc-pass") || $0.contains("rc-user") || $0.contains("password") })
     }
@@ -43,7 +46,7 @@ import Testing
         #expect(value(after: "--dir-cache-time", in: baseline) == "5m")
         #expect(!baseline.contains("--vfs-refresh") && !baseline.contains("--vfs-read-chunk-streams"))
         #expect(value(after: "--vfs-write-back", in: baseline) == "5s")
-        #expect(value(after: "--poll-interval", in: baseline) == "1m")
+        #expect(tuned.filter { $0 == "--poll-interval" }.count == 1, "one poll interval, from the user's settings")
         #expect(baseline.last == "--foo")
         // Safety-critical flags are present either way
         for args in [tuned, baseline] {
@@ -223,6 +226,145 @@ import Testing
     }
 }
 
+@Suite struct SettingsTests {
+    @Test func oldSettingsFileStillLoads() throws {
+        let old = #"{"cacheLimitGB": 25, "googleClientID": "id", "googleClientSecret": "s"}"#
+        let s = try JSONDecoder().decode(AppSettings.self, from: Data(old.utf8))
+        #expect(s.cacheLimitGB == 25 && s.googleClientID == "id")
+        #expect(s.keepFreeGB == 5 && s.keepCopiesDays == 30 && s.pollSeconds == 15)
+        #expect(s.menuBarIcon == .twoTone && s.showGoogleDocs && s.checkForUpdates && s.drivesFolder == nil)
+    }
+
+    @Test func outOfRangeValuesAreClamped() throws {
+        let odd = #"{"cacheLimitGB": 0, "keepFreeGB": 999, "keepCopiesDays": 0, "pollSeconds": 7, "menuBarIcon": "rainbow"}"#
+        let s = try JSONDecoder().decode(AppSettings.self, from: Data(odd.utf8))
+        #expect(s.cacheLimitGB == 1 && s.keepFreeGB == 200 && s.keepCopiesDays == 1 && s.pollSeconds == 15)
+        #expect(s.menuBarIcon == .twoTone)
+    }
+
+    @Test func settingsRoundTrip() throws {
+        var s = AppSettings()
+        s.menuBarIcon = .cloud; s.drivesFolder = "/Users/x/Drives"; s.pollSeconds = 300; s.lastUpdateCheck = Date(timeIntervalSince1970: 100)
+        let back = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(s))
+        #expect(back == s)
+    }
+
+    @Test func oldAccountsFileStillLoads() throws {
+        let old = #"[{"id": "abc", "provider": "googleDrive", "email": "a@b.c", "enabled": false}]"#
+        let accounts = try JSONDecoder().decode([Account].self, from: Data(old.utf8))
+        #expect(accounts.first?.displayName == nil && accounts.first?.offlineFolders == [] && accounts.first?.enabled == false)
+    }
+
+    @Test func customDriveNames() {
+        var a = Account(id: "x", provider: .googleDrive, email: "me@school.edu")
+        let paths = Paths(home: URL(fileURLWithPath: "/h"))
+        #expect(a.title == "Google Drive (me@school.edu)")
+        a.displayName = "  School Drive  "
+        #expect(a.title == "School Drive")
+        #expect(a.mountPath(in: paths).path == "/h/Kitty Finder/School Drive")
+        a.displayName = "   "
+        #expect(a.title == a.defaultTitle)
+        a.displayName = ".secret/stuff"
+        #expect(a.mountPath(in: paths).lastPathComponent == "_secret-stuff", "no hidden or nested folders")
+    }
+
+    @Test func mountOptionsReachTheEngine() {
+        var s = AppSettings()
+        s.keepFreeGB = 0; s.keepCopiesDays = 7; s.pollSeconds = 60; s.showGoogleDocs = false
+        let paths = Paths(home: URL(fileURLWithPath: "/h"))
+        let config = MountConfig(account: Account(id: "a", provider: .googleDrive, email: "e"), paths: paths, cacheLimitBytes: 1 << 30, rcPort: 1)
+        let args = MountArguments.nfsmount(config, options: s.mountOptions)
+        #expect(value(after: "--vfs-cache-max-age", in: args) == "168h")
+        #expect(value(after: "--poll-interval", in: args) == "60s")
+        #expect(!args.contains("--vfs-cache-min-free-space"), "0 GB means off")
+        #expect(args.contains("--drive-skip-gdocs=true") && !args.contains("--drive-export-formats"))
+        s.keepFreeGB = 5
+        #expect(value(after: "--vfs-cache-min-free-space", in: MountArguments.nfsmount(config, options: s.mountOptions)) == "5368709120B")
+    }
+
+    @Test func drivesFolderGuard() throws {
+        let home = FileManager.default.temporaryDirectory.appending(path: "kf-home-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let paths = Paths(home: home)
+        let ok = home.appending(path: "Drives")
+        try FileManager.default.createDirectory(at: ok, withIntermediateDirectories: true)
+        #expect(paths.drivesFolderProblem(ok, home: home) == nil)
+        #expect(paths.drivesFolderProblem(home.appending(path: "Library/Mobile Documents/com~apple~CloudDocs/X"), home: home) != nil)
+        #expect(paths.drivesFolderProblem(home.appending(path: "Library/CloudStorage/GoogleDrive-a/My Drive"), home: home) != nil)
+        #expect(paths.drivesFolderProblem(paths.appSupport.appending(path: "x"), home: home) != nil)
+        #expect(paths.drivesFolderProblem(home, home: home) != nil)
+        #expect(paths.drivesFolderProblem(URL(fileURLWithPath: "/"), home: home) != nil)
+        #expect(Paths(home: home, drivesFolder: ok.path).mountRoot.path == ok.path)
+        #expect(Paths(home: home, drivesFolder: nil).mountRoot.lastPathComponent == "Kitty Finder")
+    }
+
+    private func value(after flag: String, in args: [String]) -> String? {
+        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+}
+
+@Suite struct UpdateTests {
+    @Test func versionComparison() {
+        #expect(UpdateChecker.isNewer("v0.2.0", than: "0.1.0"))
+        #expect(UpdateChecker.isNewer("0.10.0", than: "0.9.9"))
+        #expect(UpdateChecker.isNewer("1.0", than: "0.9.9"))
+        #expect(!UpdateChecker.isNewer("0.1.0", than: "0.1.0"))
+        #expect(!UpdateChecker.isNewer("v0.1.0", than: "0.2.0"))
+        #expect(!UpdateChecker.isNewer("0.2", than: "0.2.0"))
+        #expect(UpdateChecker.isNewer("0.2.1-beta", than: "0.2.0"))
+    }
+
+    @Test func releaseParsingPicksThePublicZip() throws {
+        let json = #"""
+        {"tag_name": "v0.2.0", "name": "Kitty Finder 0.2.0", "body": "notes", "html_url": "https://github.com/o/r/releases/tag/v0.2.0",
+         "draft": false, "prerelease": false, "assets": [
+          {"name": "KittyFinder-0.2.0.zip", "size": 1, "browser_download_url": "https://x/a.zip", "digest": "sha256:aa"},
+          {"name": "KittyFinder-0.2.0-public.zip", "size": 2, "browser_download_url": "https://x/b.zip", "digest": "sha256:bb"}]}
+        """#
+        let r = try JSONDecoder().decode(Release.self, from: Data(json.utf8))
+        #expect(r.version == "0.2.0")
+        #expect(r.installAsset?.name == "KittyFinder-0.2.0-public.zip")
+        #expect(r.installAsset?.digest == "sha256:bb")
+    }
+
+    @Test func checksumVerification() throws {
+        let file = FileManager.default.temporaryDirectory.appending(path: "kf-sum-\(UUID().uuidString)")
+        try Data("hello".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let hello = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        #expect(try UpdateChecker.sha256(of: file) == hello)
+        #expect(try UpdateChecker.matches(file, digest: "sha256:" + hello))
+        #expect(try UpdateChecker.matches(file, digest: "sha256:" + hello.uppercased()), "hex case doesn't matter")
+        #expect(try !UpdateChecker.matches(file, digest: "sha256:00"))
+        #expect(try !UpdateChecker.matches(file, digest: nil), "no digest means not verified")
+    }
+}
+
+@Suite struct OfflineFolderTests {
+    @Test func manifestFindsNewAndChangedFiles() {
+        let before = OfflineManifest(files: ["a.txt": FileStamp(size: 1, modified: 1), "b.txt": FileStamp(size: 2, modified: 2)])
+        let now: [String: FileStamp] = ["a.txt": FileStamp(size: 1, modified: 1), "b.txt": FileStamp(size: 3, modified: 2),
+                                        "c.txt": FileStamp(size: 1, modified: 1)]
+        #expect(before.changed(in: now) == ["b.txt", "c.txt"])
+        #expect(OfflineManifest().changed(in: now).count == 3)
+    }
+
+    @Test func locateFolderOnADrive() {
+        let drives = [(id: "a", root: URL(fileURLWithPath: "/h/Kitty Finder/School")),
+                      (id: "b", root: URL(fileURLWithPath: "/h/Kitty Finder/School Drive"))]
+        #expect(OfflineFolders.locate(URL(fileURLWithPath: "/h/Kitty Finder/School Drive/Notes/2026"), in: drives)! == ("b", "Notes/2026"))
+        #expect(OfflineFolders.locate(URL(fileURLWithPath: "/h/Kitty Finder/School"), in: drives)! == ("a", ""))
+        #expect(OfflineFolders.locate(URL(fileURLWithPath: "/h/Documents/x"), in: drives) == nil)
+    }
+
+    @Test func addingFoldersAvoidsOverlap() {
+        #expect(OfflineFolders.adding("A/B", to: ["A"]) == ["A"], "already inside a kept folder")
+        #expect(OfflineFolders.adding("A", to: ["A/B", "C"]) == ["A", "C"], "replaces folders it contains")
+        #expect(OfflineFolders.adding("AB", to: ["A"]) == ["A", "AB"], "a name prefix isn't a parent")
+    }
+}
+
 @Suite struct UnmountTests {
     @Test func forceUnmountOfUnmountedPathIsImmediate() async {
         let start = Date()
@@ -317,4 +459,26 @@ final class Seen: @unchecked Sendable {
     private var text = ""
     var value: String { lock.withLock { text } }
     func set(_ s: String) { lock.withLock { text = s } }
+}
+
+@Suite struct DiagnosticsTests {
+    @Test func removesPersonalDetails() {
+        let home = "/Users/someone"
+        let names = ["Google Drive (me@example.com)", "Work"]
+        let text = Diagnostics.redact(
+            "Couldn't create /Users/someone/Kitty Finder/Work/Taxes 2025: permission denied", home: home, names: names)
+        #expect(text == "Couldn't create ~/Kitty Finder/<drive>/<path>: permission denied")
+        #expect(Diagnostics.redact("ERROR : Photos/beach.jpg: upload failed", home: home, names: names)
+                == "ERROR : <file>: upload failed")
+        #expect(Diagnostics.redact("token for other@gmail.com expired", home: home, names: names)
+                == "token for <email> expired")
+        #expect(Diagnostics.redact("Google Drive (me@example.com) stopped", home: home, names: names) == "<drive> stopped")
+    }
+
+    @Test func issueLinkHasOnlyVersions() throws {
+        let url = try #require(Diagnostics.issueURL(repository: "owner/repo", appVersion: "0.2.0", macOS: "15.1", engine: "v1.75.2"))
+        #expect(url.absoluteString.hasPrefix("https://github.com/owner/repo/issues/new?body="))
+        let body = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value ?? ""
+        #expect(body.contains("Kitty Finder 0.2.0 · macOS 15.1 · engine v1.75.2"))
+    }
 }

@@ -1,0 +1,1044 @@
+diff --git a/vfs/dir.go b/vfs/dir.go
+index 9e1c437..4a66a71 100644
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -55,6 +55,7 @@ const (
+ 	vAddFile               // added file
+ 	vAddDir                // added directory
+ 	vDel                   // removed file or directory
++	vCached                // file or directory listed from the vfs cache while offline
+ )
+ 
+ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
+@@ -435,21 +436,36 @@ func name(p string) string {
+ // note that we add new objects rather than updating old ones
+ func (d *Dir) addObject(node Node) {
+ 	d.mu.Lock()
++	d._addObject(node, vAddState(node.IsDir()))
++	d.mu.Unlock()
++}
++
++// vAddState returns the virtual state of an added file or directory
++func vAddState(isDir bool) vState {
++	if isDir {
++		return vAddDir
++	}
++	return vAddFile
++}
++
++// _addObject adds node to the directory as a virtual entry in state vAdd
++//
++// must be called with d.mu held
++func (d *Dir) _addObject(node Node, vAdd vState) {
+ 	leaf := node.Name()
++	// Opening an entry listed from the cache leaves it listed from the cache
++	if d.virtual[leaf] == vCached && d.items[leaf] == node {
++		return
++	}
+ 	d.items[leaf] = node
+ 	if d.virtual == nil {
+ 		d.virtual = make(map[string]vState)
+ 	}
+-	vAdd := vAddFile
+-	if node.IsDir() {
+-		vAdd = vAddDir
+-	}
+ 	if _, found := d.virtual[leaf]; !found {
+ 		d.addVirtual(1)
+ 	}
+ 	d.virtual[leaf] = vAdd
+ 	fs.Debugf(d.path, "Added virtual directory entry %v: %q", vAdd, leaf)
+-	d.mu.Unlock()
+ }
+ 
+ // AddVirtual adds a virtual object of name and size to the directory
+@@ -460,37 +476,42 @@ func (d *Dir) addObject(node Node) {
+ // This is used by the vfs cache to insert objects that are uploading
+ // into the directory tree.
+ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
+-	var node Node
+-	d.mu.RLock()
+-	dPath := d.path
+-	_, found := d.items[leaf]
+-	d.mu.RUnlock()
+-	if found {
++	d.mu.Lock()
++	d._addVirtual(leaf, size, isDir, vAddState(isDir))
++	d.mu.Unlock()
++}
++
++// _addVirtual is AddVirtual adding the entry in state vAdd
++//
++// must be called with d.mu held
++func (d *Dir) _addVirtual(leaf string, size int64, isDir bool, vAdd vState) {
++	isLink := false
++	if !isDir && d.vfs.Opt.Links {
++		// since the path came from the cache it may have fs.LinkSuffix,
++		// so remove it and mark the *File accordingly
++		leaf, isLink = strings.CutSuffix(leaf, fs.LinkSuffix)
++		if leaf == "" || leaf == "." || leaf == ".." {
++			return
++		}
++	}
++	if _, found := d.items[leaf]; found {
+ 		// Don't overwrite existing objects
+ 		return
+ 	}
++	var node Node
+ 	if isDir {
+-		remote := path.Join(dPath, leaf)
++		remote := path.Join(d.path, leaf)
+ 		entry := fs.NewDir(remote, time.Now())
+ 		node = newDir(d.vfs, d.f, d, entry)
+ 	} else {
+-		isLink := false
+-		if d.vfs.Opt.Links {
+-			// since the path came from the cache it may have fs.LinkSuffix,
+-			// so remove it and mark the *File accordingly
+-			leaf, isLink = strings.CutSuffix(leaf, fs.LinkSuffix)
+-			if leaf == "" || leaf == "." || leaf == ".." {
+-				return
+-			}
+-		}
+-		f := newFile(d, dPath, nil, leaf)
++		f := newFile(d, d.path, nil, leaf)
+ 		if isLink {
+ 			f.setSymlink()
+ 		}
+ 		f.setSize(size)
+ 		node = f
+ 	}
+-	d.addObject(node)
++	d._addObject(node, vAdd)
+ }
+ 
+ // delObject removes an object from the directory
+@@ -532,6 +553,14 @@ func (d *Dir) _readDir() error {
+ 	} else {
+ 		return nil
+ 	}
++	// While offline list what is in the cache, leaving d.read unset so
++	// the remote is listed again once online
++	if d.vfs.cache != nil && d.vfs.cache.Offline() {
++		for _, entry := range d.vfs.cache.DirList(d.path) {
++			d._addVirtual(entry.Leaf, entry.Size, entry.IsDir, vCached)
++		}
++		return nil
++	}
+ 	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
+ 	if err == fs.ErrorDirNotFound {
+ 		// We treat directory not found as empty because we
+@@ -646,6 +675,12 @@ func (d *Dir) _purgeVirtual() {
+ 				continue
+ 			}
+ 			d._deleteVirtual(name)
++		case vCached:
++			// Leave files listed from the cache while they are open or dirty
++			if f, ok := d.items[name].(*File); ok && d.vfs.cache != nil && d.vfs.cache.InUse(f.CachePath()) {
++				continue
++			}
++			d._deleteVirtual(name)
+ 		default:
+ 			d._deleteVirtual(name)
+ 		}
+@@ -677,7 +712,7 @@ func (mv manageVirtuals) add(d *Dir, name string) bool {
+ 	mv[name] = struct{}{}
+ 	// Remove virtuals if possible
+ 	switch d.virtual[name] {
+-	case vAddFile, vAddDir:
++	case vAddFile, vAddDir, vCached:
+ 		// item was added to the dir but since it is found in a
+ 		// listing is no longer virtual
+ 		d._deleteVirtual(name)
+@@ -700,7 +735,7 @@ func (mv manageVirtuals) end(d *Dir) {
+ 			// name was previously in the directory but wasn't found
+ 			// in the current listing
+ 			switch d.virtual[name] {
+-			case vAddFile, vAddDir:
++			case vAddFile, vAddDir, vCached:
+ 				// virtually added so leave virtual item
+ 			default:
+ 				// otherwise delete it
+diff --git a/vfs/offline_test.go b/vfs/offline_test.go
+new file mode 100644
+index 0000000..f91ae75
+--- /dev/null
++++ b/vfs/offline_test.go
+@@ -0,0 +1,247 @@
++package vfs
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/rc"
++	"github.com/rclone/rclone/fstest"
++	"github.com/rclone/rclone/vfs/vfscache"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++var errUnreachable = errors.New("remote unreachable")
++
++// unreachableFs is a remote which can't be listed or looked up while
++// unreachable is set, like a cloud remote with no network.
++type unreachableFs struct {
++	fs.Fs
++	unreachable atomic.Bool
++}
++
++func (f *unreachableFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
++	if f.unreachable.Load() {
++		return nil, errUnreachable
++	}
++	return f.Fs.List(ctx, dir)
++}
++
++func (f *unreachableFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
++	if f.unreachable.Load() {
++		return nil, errUnreachable
++	}
++	return f.Fs.NewObject(ctx, remote)
++}
++
++// offlineTestOpt returns options for a full cache whose files are
++// closed straight away so another VFS can load them
++func offlineTestOpt() vfscommon.Options {
++	opt := vfscommon.Opt
++	opt.CacheMode = vfscommon.CacheModeFull
++	opt.HandleCaching = 0
++	return opt
++}
++
++// list dir as "name size isDir" strings
++func offlineReadDir(t *testing.T, vfs *VFS, dir string) []string {
++	fis, err := vfs.ReadDir(dir)
++	require.NoError(t, err)
++	var out []string
++	for _, fi := range fis {
++		out = append(out, fmt.Sprintf("%s %d %v", fi.Name(), fi.Size(), fi.IsDir()))
++	}
++	return out
++}
++
++// newRestartedOfflineVFS caches some files of dir with one VFS and
++// returns a second VFS on the same cache, as after a restart, whose
++// remote is unreachable and whose cache is offline.
++func newRestartedOfflineVFS(t *testing.T) (*fstest.Run, *unreachableFs, *VFS) {
++	ctx := context.Background()
++	r := fstest.NewRun(t)
++	opt := offlineTestOpt()
++	r.WriteObject(ctx, "dir/cached", "cached contents", t1)
++	r.WriteObject(ctx, "dir/sub/deep", "deep contents", t1)
++	r.WriteObject(ctx, "dir/uncached", "uncached contents", t1)
++
++	vfs := New(ctx, r.Fremote, &opt)
++	for _, name := range []string{"dir/cached", "dir/sub/deep"} {
++		_, err := vfs.ReadFile(name)
++		require.NoError(t, err)
++	}
++	vfs.WaitForWriters(waitForWritersDelay)
++	vfs.Shutdown()
++
++	f := &unreachableFs{Fs: r.Fremote}
++	f.unreachable.Store(true)
++	vfs = New(ctx, f, &opt)
++	t.Cleanup(func() { cleanupVFS(t, vfs) })
++	vfs.cache.SetOffline(true)
++	return r, f, vfs
++}
++
++// A directory never listed shows its cached files while offline
++func TestVFSOfflineAfterRestart(t *testing.T) {
++	_, _, vfs := newRestartedOfflineVFS(t)
++
++	start := time.Now()
++	assert.Equal(t, []string{"cached 15 false", "sub 0 true"}, offlineReadDir(t, vfs, "dir"))
++
++	b, err := vfs.ReadFile("dir/cached")
++	require.NoError(t, err)
++	assert.Equal(t, "cached contents", string(b))
++	b, err = vfs.ReadFile("dir/sub/deep")
++	require.NoError(t, err)
++	assert.Equal(t, "deep contents", string(b))
++
++	_, err = vfs.ReadFile("dir/uncached")
++	assert.Equal(t, ENOENT, err)
++	assert.Less(t, time.Since(start), time.Second)
++}
++
++// Entries listed while offline are replaced by a real listing once online
++func TestVFSOfflineBackOnline(t *testing.T) {
++	r, f, vfs := newRestartedOfflineVFS(t)
++	ctx := context.Background()
++
++	assert.Equal(t, []string{"cached 15 false", "sub 0 true"}, offlineReadDir(t, vfs, "dir"))
++	_, err := vfs.ReadFile("dir/cached")
++	require.NoError(t, err)
++
++	obj, err := r.Fremote.NewObject(ctx, "dir/cached")
++	require.NoError(t, err)
++	require.NoError(t, obj.Remove(ctx))
++
++	f.unreachable.Store(false)
++	vfs.cache.SetOffline(false)
++	assert.Equal(t, []string{"sub 0 true", "uncached 17 false"}, offlineReadDir(t, vfs, "dir"))
++
++	b, err := vfs.ReadFile("dir/uncached")
++	require.NoError(t, err)
++	assert.Equal(t, "uncached contents", string(b))
++}
++
++// A cached symlink listed while offline is the same node each listing
++func TestVFSOfflineLinks(t *testing.T) {
++	ctx := context.Background()
++	r := fstest.NewRun(t)
++	opt := offlineTestOpt()
++	opt.Links = true
++	r.WriteObject(ctx, "dir/link"+fs.LinkSuffix, "target", t1)
++
++	vfs := New(ctx, r.Fremote, &opt)
++	target, err := vfs.Readlink("dir/link")
++	require.NoError(t, err)
++	assert.Equal(t, "target", target)
++	vfs.WaitForWriters(waitForWritersDelay)
++	vfs.Shutdown()
++
++	vfs = New(ctx, r.Fremote, &opt)
++	t.Cleanup(func() { cleanupVFS(t, vfs) })
++	vfs.cache.SetOffline(true)
++
++	node1, err := vfs.Stat("dir/link")
++	require.NoError(t, err)
++	node2, err := vfs.Stat("dir/link")
++	require.NoError(t, err)
++	assert.Equal(t, node1.Inode(), node2.Inode())
++	target, err = vfs.Readlink("dir/link")
++	require.NoError(t, err)
++	assert.Equal(t, "target", target)
++}
++
++// Reading data which isn't cached fails straight away while offline
++func TestVFSOfflineReadUncached(t *testing.T) {
++	opt := offlineTestOpt()
++	r, vfs := newTestVFSOpt(t, &opt)
++	r.WriteObject(context.Background(), "file", "file contents", t1)
++	_, err := vfs.Stat("file")
++	require.NoError(t, err)
++
++	vfs.cache.SetOffline(true)
++	start := time.Now()
++	_, err = vfs.ReadFile("file")
++	assert.ErrorIs(t, err, vfscache.ErrOffline)
++	assert.Less(t, time.Since(start), time.Second)
++
++	vfs.cache.SetOffline(false)
++	b, err := vfs.ReadFile("file")
++	require.NoError(t, err)
++	assert.Equal(t, "file contents", string(b))
++}
++
++func TestRcPin(t *testing.T) {
++	opt := offlineTestOpt()
++	r, vfs := newTestVFSOpt(t, &opt)
++	call := rc.Calls.Get("vfs/pin")
++	require.NotNil(t, call)
++
++	pin := func(in rc.Params) (rc.Params, error) {
++		in["fs"] = fs.ConfigString(r.Fremote)
++		return call.Fn(context.Background(), in)
++	}
++	out, err := pin(rc.Params{})
++	require.NoError(t, err)
++	assert.Equal(t, rc.Params{"pins": []string{}}, out)
++
++	out, err = pin(rc.Params{"add": "a/b"})
++	require.NoError(t, err)
++	assert.Equal(t, rc.Params{"pins": []string{"a/b"}}, out)
++
++	out, err = pin(rc.Params{"add": "/c/"})
++	require.NoError(t, err)
++	assert.Equal(t, rc.Params{"pins": []string{"a/b", "c"}}, out)
++
++	out, err = pin(rc.Params{"remove": "a/b"})
++	require.NoError(t, err)
++	assert.Equal(t, rc.Params{"pins": []string{"c"}}, out)
++	assert.Equal(t, []string{"c"}, vfs.cache.Pins())
++
++	_, err = pin(rc.Params{"dir": "a"})
++	assert.ErrorContains(t, err, "invalid parameter")
++}
++
++func TestRcOffline(t *testing.T) {
++	opt := offlineTestOpt()
++	r, vfs := newTestVFSOpt(t, &opt)
++	call := rc.Calls.Get("vfs/offline")
++	require.NotNil(t, call)
++
++	offline := func(in rc.Params) (rc.Params, error) {
++		in["fs"] = fs.ConfigString(r.Fremote)
++		return call.Fn(context.Background(), in)
++	}
++	out, err := offline(rc.Params{})
++	require.NoError(t, err)
++	assert.Equal(t, rc.Params{"offline": false}, out)
++
++	out, err = offline(rc.Params{"offline": true})
++	require.NoError(t, err)
++	assert.Equal(t, rc.Params{"offline": true}, out)
++	assert.True(t, vfs.cache.Offline())
++
++	out, err = offline(rc.Params{"offline": "false"})
++	require.NoError(t, err)
++	assert.Equal(t, rc.Params{"offline": false}, out)
++	assert.False(t, vfs.cache.Offline())
++
++	_, err = offline(rc.Params{"offline": "maybe"})
++	assert.Error(t, err)
++}
++
++func TestRcPinOfflineNoCache(t *testing.T) {
++	r, _ := newTestVFS(t)
++	for _, method := range []string{"vfs/pin", "vfs/offline"} {
++		call := rc.Calls.Get(method)
++		require.NotNil(t, call)
++		_, err := call.Fn(context.Background(), rc.Params{"fs": fs.ConfigString(r.Fremote)})
++		assert.ErrorContains(t, err, "VFS cache", method)
++	}
++}
+diff --git a/vfs/rc.go b/vfs/rc.go
+index e45b0b3..2f74773 100644
+--- a/vfs/rc.go
++++ b/vfs/rc.go
+@@ -578,3 +578,122 @@ func rcQueueSetExpiry(ctx context.Context, in rc.Params) (out rc.Params, err err
+ 	err = vfs.cache.QueueSetExpiry(writeback.Handle(id), refTime, time.Duration(float64(time.Second)*expiry))
+ 	return nil, err
+ }
++
++func init() {
++	rc.Add(rc.Call{
++		Path:  "vfs/pin",
++		Title: "Keep files in the VFS cache.",
++		Help: strings.ReplaceAll(`
++This pins a directory or file so that the items in the VFS cache under
++it are never removed by the cache cleaner. Pinned items don't count
++towards |--vfs-cache-max-size|.
++
++Pinning doesn't download anything - files are cached when they are
++read. Pins are kept in memory so need adding again after a restart.
++
++    rclone rc vfs/pin add=path/to/dir
++
++This takes the following parameters
++
++- |fs| - select the VFS in use (optional)
++- |add| - a path relative to the root of the remote to pin (optional)
++- |remove| - a path to unpin (optional)
++
++It returns the sorted list of pinned paths
++
++    {
++        "pins": ["path/to/dir"]
++    }
++
++This will return an error if called with |--vfs-cache-mode| off.
++
++`, "|", "`") + getVFSHelp,
++		Fn: rcPin,
++	})
++}
++
++func rcPin(ctx context.Context, in rc.Params) (out rc.Params, err error) {
++	vfs, err := getVFS(in)
++	if err != nil {
++		return nil, err
++	}
++	if vfs.cache == nil {
++		return nil, rc.NewErrParamInvalid(errors.New("can't call this unless using the VFS cache"))
++	}
++	add, addErr := in.GetString("add")
++	remove, removeErr := in.GetString("remove")
++	for _, err := range []error{addErr, removeErr} {
++		if err != nil && !rc.IsErrParamNotFound(err) {
++			return nil, err
++		}
++	}
++	delete(in, "add")
++	delete(in, "remove")
++	for k, v := range in {
++		return nil, fmt.Errorf("invalid parameter: %s=%v", k, v)
++	}
++	if addErr == nil {
++		vfs.cache.Pin(add)
++	}
++	if removeErr == nil {
++		vfs.cache.Unpin(remove)
++	}
++	return rc.Params{"pins": vfs.cache.Pins()}, nil
++}
++
++func init() {
++	rc.Add(rc.Call{
++		Path:  "vfs/offline",
++		Title: "Get or set whether the VFS cache is offline.",
++		Help: strings.ReplaceAll(`
++While offline, data which isn't in the VFS cache is never downloaded,
++so reading it fails straight away rather than retrying the remote.
++
++Directories without an up to date listing in the directory cache are
++listed from the VFS cache instead, showing the files which are wholly
++in the cache and the directories holding them. These entries are
++replaced by a listing of the remote the next time the directory is
++read once back online.
++
++    rclone rc vfs/offline offline=true
++
++This takes the following parameters
++
++- |fs| - select the VFS in use (optional)
++- |offline| - true to go offline, false to go back online (optional)
++
++It returns the current state
++
++    {
++        "offline": true
++    }
++
++This will return an error if called with |--vfs-cache-mode| off.
++
++`, "|", "`") + getVFSHelp,
++		Fn: rcOffline,
++	})
++}
++
++func rcOffline(ctx context.Context, in rc.Params) (out rc.Params, err error) {
++	vfs, err := getVFS(in)
++	if err != nil {
++		return nil, err
++	}
++	if vfs.cache == nil {
++		return nil, rc.NewErrParamInvalid(errors.New("can't call this unless using the VFS cache"))
++	}
++	offline, err := in.GetBool("offline")
++	found := err == nil
++	if err != nil && !rc.IsErrParamNotFound(err) {
++		return nil, err
++	}
++	delete(in, "offline")
++	for k, v := range in {
++		return nil, fmt.Errorf("invalid parameter: %s=%v", k, v)
++	}
++	if found {
++		vfs.cache.SetOffline(offline)
++	}
++	return rc.Params{"offline": vfs.cache.Offline()}, nil
++}
+diff --git a/vfs/vfscache/cache.go b/vfs/vfscache/cache.go
+index ca79f22..9cb2185 100644
+--- a/vfs/vfscache/cache.go
++++ b/vfs/vfscache/cache.go
+@@ -12,6 +12,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/rclone/rclone/fs"
+@@ -52,17 +53,21 @@ type Cache struct {
+ 	hashOption *fs.HashesOption     // corresponding OpenOption
+ 	writeback  *writeback.WriteBack // holds Items for writeback
+ 	avFn       AddVirtualFn         // if set, can be called to add dir entries
++	offline    atomic.Bool          // set if data must not be downloaded
+ 
+ 	mu            sync.Mutex       // protects the following variables
+ 	cond          sync.Cond        // cond lock for synchronous cache cleaning
+ 	item          map[string]*Item // files/directories in the cache
+ 	errItems      map[string]error // items in error state
+ 	used          int64            // total size of files in the cache
++	pinned        int64            // total size of pinned files in the cache
+ 	outOfSpace    bool             // out of space
+ 	cleanerKicked bool             // some thread kicked the cleaner upon out of space
+ 	kickerMu      sync.Mutex       // mutex for cleanerKicked
+ 	kick          chan struct{}    // channel for kicking clear to start
+ 
++	pinMu sync.Mutex          // protects pins
++	pins  map[string]struct{} // pinned directories and files
+ }
+ 
+ // AddVirtualFn if registered by the WithAddVirtual method, can be
+@@ -130,6 +135,7 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
+ 		hashOption: hashOption,
+ 		writeback:  writeback.New(ctx, opt),
+ 		avFn:       avFn,
++		pins:       make(map[string]struct{}),
+ 	}
+ 
+ 	// load in the cache and metadata off disk
+@@ -188,6 +194,118 @@ func (c *Cache) QueueSetExpiry(id writeback.Handle, expiry time.Time, relative t
+ 	return c.writeback.SetExpiry(id, expiry, relative)
+ }
+ 
++// ErrOffline is returned when data which isn't in the cache is needed
++// while the cache is offline.
++var ErrOffline = errors.New("vfs cache: offline and data not in cache")
++
++// SetOffline sets whether the cache is offline.
++//
++// While offline, data which isn't in the cache is never downloaded and
++// ErrOffline is returned instead.
++func (c *Cache) SetOffline(offline bool) {
++	c.offline.Store(offline)
++}
++
++// Offline returns whether the cache is offline, see SetOffline
++func (c *Cache) Offline() bool {
++	return c.offline.Load()
++}
++
++// Pin stops the cache cleaner removing the item called name or any
++// items in the directory called name.
++//
++// Pinned items don't count towards the maximum cache size.
++//
++// name should be a remote path not an osPath
++func (c *Cache) Pin(name string) {
++	c.pinMu.Lock()
++	c.pins[clean(name)] = struct{}{}
++	c.pinMu.Unlock()
++}
++
++// Unpin removes a pin added by Pin
++//
++// name should be a remote path not an osPath
++func (c *Cache) Unpin(name string) {
++	c.pinMu.Lock()
++	delete(c.pins, clean(name))
++	c.pinMu.Unlock()
++}
++
++// Pins returns the sorted names added by Pin
++func (c *Cache) Pins() []string {
++	c.pinMu.Lock()
++	defer c.pinMu.Unlock()
++	pins := make([]string, 0, len(c.pins))
++	for name := range c.pins {
++		pins = append(pins, name)
++	}
++	sort.Strings(pins)
++	return pins
++}
++
++// isPinned returns whether name or any of its parents are pinned
++//
++// name should be a cleaned remote path as used in the index map
++func (c *Cache) isPinned(name string) bool {
++	c.pinMu.Lock()
++	defer c.pinMu.Unlock()
++	if len(c.pins) == 0 {
++		return false
++	}
++	for {
++		if _, found := c.pins[name]; found {
++			return true
++		}
++		if name == "" {
++			return false
++		}
++		name = vfscommon.FindParent(name)
++	}
++}
++
++// DirListEntry is an entry of a directory returned by DirList
++type DirListEntry struct {
++	Leaf  string // name of the entry in the directory
++	Size  int64  // size of the file
++	IsDir bool   // set if the entry is a directory
++}
++
++// DirList returns the entries of the directory dir which can be used
++// from the cache alone: the files in dir which are entirely in the
++// cache and the directories in dir which have such files in them.
++//
++// dir should be a remote path not an osPath
++func (c *Cache) DirList(dir string) (entries []DirListEntry) {
++	prefix := clean(dir)
++	if prefix != "" {
++		prefix += "/"
++	}
++	dirs := make(map[string]struct{})
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for name, item := range c.item {
++		rest, found := strings.CutPrefix(name, prefix)
++		if !found || rest == "" {
++			continue
++		}
++		leaf, _, isDir := strings.Cut(rest, "/")
++		if _, found := dirs[leaf]; found {
++			continue
++		}
++		size, cached := item.cached()
++		if !cached {
++			continue
++		}
++		if isDir {
++			dirs[leaf] = struct{}{}
++			size = 0
++		}
++		entries = append(entries, DirListEntry{Leaf: leaf, Size: size, IsDir: isDir})
++	}
++	return entries
++}
++
+ // createDir creates a directory path, along with any necessary parents
+ func createDir(dir string) error {
+ 	return file.MkdirAll(dir, 0700)
+@@ -648,9 +766,9 @@ func (c *Cache) purgeClean() {
+ 
+ 	var items Items
+ 
+-	// Make a slice of clean cache files
+-	for _, item := range c.item {
+-		if !item.IsDirty() {
++	// Make a slice of clean cache files which aren't pinned
++	for name, item := range c.item {
++		if !item.IsDirty() && !c.isPinned(name) {
+ 			items = append(items, item)
+ 		}
+ 	}
+@@ -689,8 +807,10 @@ func (c *Cache) purgeOld(maxAge time.Duration) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	// cutoff := time.Now().Add(-maxAge)
+-	for _, item := range c.item {
+-		c.removeNotInUse(item, maxAge, false)
++	for name, item := range c.item {
++		if !c.isPinned(name) {
++			c.removeNotInUse(item, maxAge, false)
++		}
+ 	}
+ 	if c.quotasOK() {
+ 		c.outOfSpace = false
+@@ -716,11 +836,16 @@ func (c *Cache) updateUsed() (used int64) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
+-	newUsed := int64(0)
+-	for _, item := range c.item {
+-		newUsed += item.getDiskSize()
++	newUsed, newPinned := int64(0), int64(0)
++	for name, item := range c.item {
++		size := item.getDiskSize()
++		newUsed += size
++		if c.isPinned(name) {
++			newPinned += size
++		}
+ 	}
+ 	c.used = newUsed
++	c.pinned = newPinned
+ 	return newUsed
+ }
+ 
+@@ -742,12 +867,14 @@ func (c *Cache) minFreeSpaceQuotaOK() bool {
+ 
+ // Check the available quota for a disk is in limits.
+ //
++// Pinned files don't count towards the quota.
++//
+ // must be called with mu held.
+ func (c *Cache) maxSizeQuotaOK() bool {
+ 	if c.opt.CacheMaxSize <= 0 {
+ 		return true
+ 	}
+-	return c.used <= int64(c.opt.CacheMaxSize)
++	return c.used-c.pinned <= int64(c.opt.CacheMaxSize)
+ }
+ 
+ // Check the available quotas for a disk is in limits.
+@@ -776,9 +903,9 @@ func (c *Cache) purgeOverQuota() {
+ 
+ 	var items Items
+ 
+-	// Make a slice of unused files
+-	for _, item := range c.item {
+-		if !item.inUse() {
++	// Make a slice of unused files which aren't pinned
++	for name, item := range c.item {
++		if !item.inUse() && !c.isPinned(name) {
+ 			items = append(items, item)
+ 		}
+ 	}
+diff --git a/vfs/vfscache/item.go b/vfs/vfscache/item.go
+index f25f907..597ac69 100644
+--- a/vfs/vfscache/item.go
++++ b/vfs/vfscache/item.go
+@@ -901,8 +901,11 @@ func (item *Item) _checkObject(o fs.Object) error {
+ 	if o == nil {
+ 		if item.info.Fingerprint != "" {
+ 			// no remote object && local object
+-			// remove local object unless dirty
+-			if !item.info.Dirty {
++			// remove local object unless dirty or offline, when
++			// the remote object is unknown rather than deleted
++			if item.c.Offline() {
++				fs.Debugf(item.name, "vfs cache: offline so keeping cached object without a remote object")
++			} else if !item.info.Dirty {
+ 				item._remove("stale (remote deleted)")
+ 			} else {
+ 				fs.Debugf(item.name, "vfs cache: remote object has gone but local object modified - keeping it")
+@@ -1219,6 +1222,15 @@ func (item *Item) present() bool {
+ 	return item._present()
+ }
+ 
++// cached returns the size of the item and whether the whole of it is
++// in the cache
++func (item *Item) cached() (size int64, ok bool) {
++	item.mu.Lock()
++	defer item.mu.Unlock()
++	// Items with no fingerprint which aren't dirty have no cache file
++	return item.info.Size, (item.info.Fingerprint != "" || item.info.Dirty) && item._present()
++}
++
+ // HasRange returns true if the current ranges entirely include range
+ func (item *Item) HasRange(r ranges.Range) bool {
+ 	item.mu.Lock()
+@@ -1269,11 +1281,16 @@ func (item *Item) _ensure(offset, size int64) (err error) {
+ 		return errors.New("no space left on device")
+ 	} */
+ 	fs.Debugf(nil, "vfs cache: looking for range=%+v in %+v - present %v", r, item.info.Rs, present)
++	offline := item.c.Offline()
++	if !present && offline {
++		return ErrOffline
++	}
+ 	item.mu.Unlock()
+ 	defer item.mu.Lock()
+ 	if present {
+-		// This is a file we are writing so no downloaders needed
+-		if item.downloaders == nil {
++		// This is a file we are writing so no downloaders needed,
++		// and there is no reading ahead while offline
++		if item.downloaders == nil || offline {
+ 			return nil
+ 		}
+ 		// Otherwise start the downloader for the future if required
+diff --git a/vfs/vfscache/pin_test.go b/vfs/vfscache/pin_test.go
+new file mode 100644
+index 0000000..90bcc88
+--- /dev/null
++++ b/vfs/vfscache/pin_test.go
+@@ -0,0 +1,189 @@
++package vfscache
++
++import (
++	"sort"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// write contents to a new item called name and close it
++func itemWriteClose(t *testing.T, c *Cache, name, contents string) *Item {
++	item := c.Item(name)
++	itemWrite(t, item, contents)
++	require.NoError(t, item.Close(nil))
++	return item
++}
++
++// read all of the open item and check it holds contents
++func itemReadAll(t *testing.T, item *Item, contents string) {
++	buf := make([]byte, len(contents))
++	_, err := item.ReadAt(buf, 0)
++	require.NoError(t, err)
++	assert.Equal(t, contents, string(buf))
++}
++
++func TestCachePins(t *testing.T) {
++	_, c := newTestCache(t)
++
++	assert.Equal(t, []string{}, c.Pins())
++
++	c.Pin("/a/b/")
++	c.Pin("c")
++	c.Pin("c")
++	assert.Equal(t, []string{"a/b", "c"}, c.Pins())
++
++	assert.True(t, c.isPinned("a/b"))
++	assert.True(t, c.isPinned("a/b/file"))
++	assert.True(t, c.isPinned("c/d/e"))
++	assert.False(t, c.isPinned("a"))
++	assert.False(t, c.isPinned("a/bc"))
++	assert.False(t, c.isPinned("d"))
++
++	c.Unpin("a/b/")
++	c.Unpin("notpinned")
++	assert.Equal(t, []string{"c"}, c.Pins())
++	assert.False(t, c.isPinned("a/b/file"))
++
++	c.Pin("")
++	assert.True(t, c.isPinned("d"))
++}
++
++func TestCachePinPurgeOld(t *testing.T) {
++	_, c := newTestCache(t)
++
++	for _, name := range []string{"pinned/potato", "pinned/sub/potato2", "pinnedx/potato3", "other/potato4"} {
++		itemWriteClose(t, c, name, "hello")
++	}
++	c.Pin("pinned")
++
++	c.purgeOld(-10 * time.Second)
++	assert.Equal(t, []string{
++		`name="pinned/potato" opens=0 size=5`,
++		`name="pinned/sub/potato2" opens=0 size=5`,
++	}, itemAsString(c))
++
++	c.Unpin("pinned")
++	c.purgeOld(-10 * time.Second)
++	assert.Equal(t, []string(nil), itemAsString(c))
++}
++
++func TestCachePinPurgeOverQuota(t *testing.T) {
++	_, c := newTestCache(t)
++
++	pinned := itemWriteClose(t, c, "pinned/potato", "hello")
++	other := itemWriteClose(t, c, "other/potato2", "hello2")
++	c.Pin("pinned")
++	c.updateUsed()
++
++	// The 5 pinned bytes don't count towards the 11 bytes used
++	c.opt.CacheMaxSize = 6
++	c.mu.Lock()
++	assert.True(t, c.quotasOK())
++	c.opt.CacheMaxSize = 5
++	assert.False(t, c.quotasOK())
++	c.mu.Unlock()
++
++	// The unpinned item goes even though the pinned one is older
++	pinned.info.ATime = time.Now().Add(-time.Hour)
++	other.info.ATime = time.Now()
++	c.opt.CacheMaxSize = 1
++	c.purgeOverQuota()
++	assert.Equal(t, []string{
++		`name="pinned/potato" opens=0 size=5`,
++	}, itemAsString(c))
++	assert.Equal(t, int64(5), c.used)
++}
++
++func TestCachePinPurgeClean(t *testing.T) {
++	r, c := newItemTestCache(t)
++
++	pinnedContents, pinnedObj, pinned := newFile(t, r, c, "pinned/existing")
++	otherContents, otherObj, other := newFile(t, r, c, "other/existing")
++	require.NoError(t, pinned.Open(pinnedObj))
++	require.NoError(t, other.Open(otherObj))
++	itemReadAll(t, pinned, pinnedContents)
++	itemReadAll(t, other, otherContents)
++	c.Pin("pinned")
++
++	// The open unpinned item is reset even though the pinned one is older
++	pinned.info.ATime = time.Now().Add(-time.Hour)
++	other.info.ATime = time.Now()
++	c.updateUsed()
++	c.opt.CacheMaxSize = 1
++	c.purgeClean()
++	assert.Equal(t, []string{
++		`name="other/existing" opens=1 size=100 space=0`,
++		`name="pinned/existing" opens=1 size=100 space=100`,
++	}, itemSpaceAsString(c))
++
++	require.NoError(t, pinned.Close(nil))
++	require.NoError(t, other.Close(nil))
++}
++
++func TestCacheDirList(t *testing.T) {
++	r, c := newItemTestCache(t)
++
++	// Fully downloaded files
++	for _, name := range []string{"dir/full", "dir/sub/deep", "dir/link.rclonelink"} {
++		contents, obj, item := newFile(t, r, c, name)
++		require.NoError(t, item.Open(obj))
++		itemReadAll(t, item, contents)
++		require.NoError(t, item.Close(nil))
++	}
++
++	// Files opened but not downloaded
++	for _, name := range []string{"dir/notdownloaded", "dir/sub2/notdownloaded"} {
++		_, obj, item := newFile(t, r, c, name)
++		require.NoError(t, item.Open(obj))
++		require.NoError(t, item.Close(nil))
++	}
++
++	// A file written locally and an item with no cache file
++	itemWriteClose(t, c, "dir/written", "hello")
++	c.Item("dir/placeholder")
++
++	dirList := func(dir string) []DirListEntry {
++		entries := c.DirList(dir)
++		sort.Slice(entries, func(i, j int) bool { return entries[i].Leaf < entries[j].Leaf })
++		return entries
++	}
++	assert.Equal(t, []DirListEntry{
++		{Leaf: "full", Size: 100},
++		{Leaf: "link.rclonelink", Size: 100},
++		{Leaf: "sub", IsDir: true},
++		{Leaf: "written", Size: 5},
++	}, dirList("dir"))
++	assert.Equal(t, []DirListEntry{{Leaf: "dir", IsDir: true}}, dirList(""))
++	assert.Equal(t, []DirListEntry{{Leaf: "deep", Size: 100}}, dirList("/dir/sub/"))
++	assert.Equal(t, []DirListEntry(nil), dirList("dir/sub2"))
++	assert.Equal(t, []DirListEntry(nil), dirList("nothing"))
++}
++
++func TestItemReadAtOffline(t *testing.T) {
++	r, c := newItemTestCache(t)
++	contents, obj, item := newFile(t, r, c, "existing")
++	require.NoError(t, item.Open(obj))
++	defer func() {
++		require.NoError(t, item.Close(nil))
++	}()
++
++	assert.False(t, c.Offline())
++	c.SetOffline(true)
++	assert.True(t, c.Offline())
++
++	buf := make([]byte, len(contents))
++	start := time.Now()
++	_, err := item.ReadAt(buf, 0)
++	assert.ErrorIs(t, err, ErrOffline)
++	assert.Less(t, time.Since(start), time.Second)
++
++	c.SetOffline(false)
++	itemReadAll(t, item, contents)
++
++	// Data already in the cache can be read while offline
++	c.SetOffline(true)
++	itemReadAll(t, item, contents)
++}
+diff --git a/vfs/vstate_string.go b/vfs/vstate_string.go
+index fd9fe44..1ad1c4a 100644
+--- a/vfs/vstate_string.go
++++ b/vfs/vstate_string.go
+@@ -12,11 +12,12 @@ func _() {
+ 	_ = x[vAddFile-1]
+ 	_ = x[vAddDir-2]
+ 	_ = x[vDel-3]
++	_ = x[vCached-4]
+ }
+ 
+-const _vState_name = "vOKvAddFilevAddDirvDel"
++const _vState_name = "vOKvAddFilevAddDirvDelvCached"
+ 
+-var _vState_index = [...]uint8{0, 3, 11, 18, 22}
++var _vState_index = [...]uint8{0, 3, 11, 18, 22, 29}
+ 
+ func (i vState) String() string {
+ 	if i >= vState(len(_vState_index)-1) {

@@ -104,3 +104,33 @@
 ### Not yet verified
 - By hand in Finder: Quick Look, TextEdit/Preview save, drag-copy, sleep/wake, offline.
 - Launch at login, a second Mac.
+
+## v0.2.0 — Settings, customization, updates, Keep Offline (2026-11-08)
+- [x] Settings window fixed (was empty: SwiftUI form with no height) → toolbar tabs
+      General / Drives / Storage / Sync / Google / Updates / About, 640×560
+- [x] Custom drive names (Finder folder + volume follow, remount), menu bar icon styles
+      (two-tone, outline, cloud), upload counter toggle, show window at launch
+- [x] Drives folder location with guard (refuses ~/Library, iCloud Drive, CloudStorage,
+      other disks, iCloud-synced folders); move remounts every drive
+- [x] Storage: space limit, keep N GB free, clear after N days; Sync: poll 15 s / 1 min / 5 min,
+      connect/disconnect all; Google Docs on/off
+- [x] Updates: GitHub releases/latest, SHA-256 digest check, codesign + bundle id + version
+      check, swap in place, relaunch; daily auto-check
+- [x] Notifications: upload problems, offline folder ready, update available
+- [x] About: versions, links, Report a Problem (GitHub issue with versions only),
+      Copy Diagnostics (redacted), Reset Kitty Finder
+- [x] Keep Offline: patch 0003 (pins + offline mode, Go tests), app OfflineSync (manifest,
+      3 at a time, free-space check, every 15 min and on reconnect), NWPathMonitor →
+      vfs/offline, Finder Services "Keep Offline" / "Stop Keeping Offline"
+- [x] Patch 0004: Drive saves root_folder_id, so a drive mounts with no internet
+- [x] `--timeout 1m --contimeout 15s`: a request stalled across a Wi-Fi reconnect hung the
+      mount for minutes (rclone default idle timeout 5m)
+
+### Review (verified on the real Drive)
+- 39 unit tests and the rclone vfs / nfs / drive Go tests pass.
+- Settings tabs and icon styles checked by hand; rename and restore; Stop Keeping Offline.
+- Offline (Wi-Fi off, scripted): browse/read/5 MB file instant, non-offline file fails in
+  0.02 s, **restart while offline mounts in 2 s** with the folder intact, offline edit
+  uploaded 13 s after reconnecting. First run failed (no root ID offline) → patch 0004.
+- Finder needed a relaunch to show the new Services entries the first time.
+- Updater: tested end to end after the v0.2.0 release (an 0.1.9 build updating itself).

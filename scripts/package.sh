@@ -4,7 +4,7 @@
 # and is named dist/KittyFinder-<version>-public.zip.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.2.0}"
 VERSION="$VERSION" "$ROOT/scripts/bundle.sh"
 mkdir -p "$ROOT/dist"
 SUFFIX=""

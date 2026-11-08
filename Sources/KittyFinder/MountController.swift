@@ -26,6 +26,14 @@ final class MountController {
     private var wantRunning = false
     private var configPassword = ""
     private var cacheLimitBytes: Int64 = 0
+    private var options = MountOptions()
+
+    /// Called each time the drive becomes available (after start, restart or wake).
+    @ObservationIgnored var onMounted: (() -> Void)?
+    /// Called when the drive stops working or a file fails to upload, with a message for people.
+    @ObservationIgnored var onProblem: ((String) -> Void)?
+    /// False once the engine has said it can't keep folders offline (an older engine).
+    private(set) var supportsOffline = true
 
     init(account: Account, paths: Paths, rclone: Rclone) {
         self.account = account
@@ -37,9 +45,10 @@ final class MountController {
     var isRunning: Bool { process != nil }
     var pendingUploads: Int { stats?.pendingUploads ?? 0 }
 
-    func start(configPassword: String, cacheLimitBytes: Int64) {
+    func start(configPassword: String, cacheLimitBytes: Int64, options: MountOptions) {
         self.configPassword = configPassword
         self.cacheLimitBytes = cacheLimitBytes
+        self.options = options
         wantRunning = true
         restartAttempts = 0
         launch()
@@ -133,7 +142,7 @@ final class MountController {
         // restores the original settings; ExtraMountArguments (string array) adds rclone flags.
         let defaults = UserDefaults.standard
         let tuning: MountTuning = defaults.bool(forKey: "UseBaselineTuning") ? .baseline : .tuned
-        process.arguments = MountArguments.nfsmount(config, tuning: tuning,
+        process.arguments = MountArguments.nfsmount(config, tuning: tuning, options: options,
                                                     extra: defaults.stringArray(forKey: "ExtraMountArguments") ?? [])
         process.environment = MountArguments.environment(configPassword: configPassword, rcUser: rc.user, rcPass: rc.password)
         process.standardInput = FileHandle.nullDevice
@@ -164,8 +173,13 @@ final class MountController {
                 if state == .starting {
                     state = .mounted
                     restartAttempts = 0
+                    onMounted?()
                 }
                 if let rc = remoteControl, let fresh = try? await rc.vfsStats() {
+                    if fresh.erroredFiles > (stats?.erroredFiles ?? 0) {
+                        let n = fresh.erroredFiles
+                        onProblem?("\(n) file\(n == 1 ? "" : "s") couldn't upload. Kitty Finder keeps trying.")
+                    }
                     stats = fresh
                 }
             }
@@ -201,6 +215,34 @@ final class MountController {
         scheduleRestart()
     }
 
+    // MARK: Offline folders
+
+    /// Makes the engine keep exactly `folders` downloaded (drive-relative paths).
+    func applyOfflineFolders(_ folders: [String]) async {
+        guard let rc = remoteControl, supportsOffline else { return }
+        do {
+            let current = Set(try await rc.pins())
+            for folder in Set(folders).subtracting(current) { try await rc.pin(folder) }
+            for folder in current.subtracting(folders) { try await rc.unpin(folder) }
+        } catch RemoteControlError.unsupported {
+            supportsOffline = false
+        } catch {
+            NSLog("Kitty Finder: offline folders: \(error.localizedDescription)")
+        }
+    }
+
+    /// Tells the engine whether the Mac is offline.
+    func setOffline(_ offline: Bool) async {
+        guard let rc = remoteControl, supportsOffline else { return }
+        do {
+            try await rc.setOffline(offline)
+        } catch RemoteControlError.unsupported {
+            supportsOffline = false
+        } catch {
+            NSLog("Kitty Finder: offline mode: \(error.localizedDescription)")
+        }
+    }
+
     private func scheduleRestart() {
         restartAttempts += 1
         let delay = min(pow(2.0, Double(restartAttempts)), 60)
@@ -214,6 +256,7 @@ final class MountController {
 
     private func fail(_ message: String) {
         state = .failed(message)
+        onProblem?(message)
     }
 
     private var stderrLog: URL { paths.logs.appending(path: "\(account.id).stderr.log") }

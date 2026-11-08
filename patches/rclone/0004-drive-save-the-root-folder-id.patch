@@ -1,0 +1,24 @@
+drive: save the root folder ID in the config
+
+rclone looks up the ID of the drive root at every start, so a drive
+can never start without a network connection. Save it in the config
+the first time, as rclone already suggests in its debug log, so
+Kitty Finder can mount a drive offline and serve its offline folders.
+
+diff --git a/backend/drive/drive.go b/backend/drive/drive.go
+index 42c563c..de1f372 100644
+--- a/backend/drive/drive.go
++++ b/backend/drive/drive.go
+@@ -1473,7 +1473,11 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
+ 			}
+ 		}
+ 		f.rootFolderID = rootID
+-		fs.Debugf(f, "'root_folder_id = %s' - save this in the config to speed up startup", rootID)
++		if rootID != "root" {
++			// Remember it, so the remote can start without a network connection
++			// (and a little faster) next time.
++			m.Set("root_folder_id", rootID)
++		}
+ 	}
+ 
+ 	f.dirCache = dircache.New(f.root, f.rootFolderID, f)

@@ -20,11 +20,16 @@ public struct OAuthClient: Equatable, Sendable {
     public static func resolve(settings: AppSettings, bundle: Bundle = .main) -> OAuthClient? {
         let fromSettings = OAuthClient(id: settings.googleClientID, secret: settings.googleClientSecret)
         if fromSettings.isComplete { return fromSettings }
+        return bundled(bundle: bundle)
+    }
+
+    /// The client built into this copy of the app (GoogleOAuth.plist), if any.
+    public static func bundled(bundle: Bundle = .main) -> OAuthClient? {
         guard let url = bundle.url(forResource: "GoogleOAuth", withExtension: "plist"),
               let dict = NSDictionary(contentsOf: url) as? [String: String],
               let id = dict["ClientID"], let secret = dict["ClientSecret"] else { return nil }
-        let bundled = OAuthClient(id: id, secret: secret)
-        return bundled.isComplete ? bundled : nil
+        let client = OAuthClient(id: id, secret: secret)
+        return client.isComplete ? client : nil
     }
 }
 

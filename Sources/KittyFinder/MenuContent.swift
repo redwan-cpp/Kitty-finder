@@ -29,8 +29,33 @@ struct MenuContent: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if model.isOffline && !model.accounts.isEmpty {
+                Label("You're offline. Offline folders and files already on this Mac still open; changes upload when you're back.",
+                      systemImage: "wifi.slash")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let release = model.updater.available {
+                Button {
+                    model.openSettingsHandler?(.updates)
+                } label: {
+                    Label("Kitty Finder \(release.version) is available", systemImage: "arrow.down.circle.fill")
+                }
+            }
+
             ForEach(model.accounts) { account in
                 AccountRow(account: account)
+            }
+
+            if model.accounts.contains(where: { !$0.offlineFolders.isEmpty }) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Offline folders")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    OfflineFolderList(compact: true)
+                }
             }
 
             SignInStatus()
@@ -47,7 +72,7 @@ struct MenuContent: View {
             Divider()
 
             HStack {
-                Button("Settings…") { model.openSettingsHandler?() }
+                Button("Settings…") { model.openSettingsHandler?(nil) }
                 Spacer()
                 // On the next run-loop turn, so quitting can wait for drives to stop
                 Button("Quit Kitty Finder") { RunLoop.main.perform { NSApp.terminate(nil) } }
@@ -77,10 +102,11 @@ struct AccountRow: View {
                 .frame(width: 8, height: 8)
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
-                Text(account.email)
+                Text(account.title)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(detail(state: state, controller: controller))
+                    .help(account.email)
+                Text(driveStatusText(account: account, state: state, controller: controller))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -110,23 +136,25 @@ struct AccountRow: View {
         case .stopped, .paused: return .gray
         }
     }
+}
 
-    private func detail(state: MountState, controller: MountController?) -> String {
-        switch state {
-        case .starting:
-            return "Connecting…"
-        case .mounted:
-            let pending = controller?.pendingUploads ?? 0
-            let local = ByteFormat.string(controller?.stats?.bytesUsed ?? 0)
-            if pending > 0 { return "Uploading \(pending) file\(pending == 1 ? "" : "s")… · \(local) on this Mac" }
-            return "Up to date · \(local) on this Mac"
-        case .paused:
-            return "Ejected. Click ▶︎ to reconnect."
-        case .stopped:
-            return account.enabled ? "Not connected" : "Disconnected"
-        case .failed(let message):
-            return message
-        }
+/// One line saying how a drive is doing.
+@MainActor
+func driveStatusText(account: Account, state: MountState, controller: MountController?) -> String {
+    switch state {
+    case .starting:
+        return "Connecting…"
+    case .mounted:
+        let pending = controller?.pendingUploads ?? 0
+        let local = ByteFormat.string(controller?.stats?.bytesUsed ?? 0)
+        if pending > 0 { return "Uploading \(pending) file\(pending == 1 ? "" : "s")… · \(local) on this Mac" }
+        return "Up to date · \(local) on this Mac"
+    case .paused:
+        return "Ejected. Click ▶︎ to reconnect."
+    case .stopped:
+        return account.enabled ? "Not connected" : "Disconnected"
+    case .failed(let message):
+        return message
     }
 }
 

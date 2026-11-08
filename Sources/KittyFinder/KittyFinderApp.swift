@@ -1,6 +1,7 @@
 import AppKit
 import KittyFinderCore
 import SwiftUI
+import UserNotifications
 
 /// Kitty Finder is a menu bar app built on AppKit (status item + popover),
 /// with SwiftUI views inside. There is no Dock icon (LSUIElement).
@@ -16,12 +17,13 @@ enum KittyFinderMain {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     let model = AppModel()
     private var quitting = false
     private var statusItem: StatusItemController?
     private var window: NSWindow?
-    private var settingsWindow: NSWindow?
+    private var settings: SettingsWindowController?
+    private var services: FinderServices?
 
     private var terminationSignal: DispatchSourceSignal?
 
@@ -36,12 +38,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         source.resume()
         terminationSignal = source
 
-        model.openSettingsHandler = { [weak self] in self?.showSettings() }
+        model.openSettingsHandler = { [weak self] tab in self?.showSettings(tab) }
         statusItem = StatusItemController(model: model)
+        UNUserNotificationCenter.current().delegate = self
+        // Finder → right-click a folder → Quick Actions → Keep Offline
+        let services = FinderServices(model: model)
+        self.services = services
+        NSApp.servicesProvider = services
+        NSUpdateDynamicServices()
         Task {
             await model.start()
             // Until the first drive is added, show a window too: a menu bar icon is easy to miss.
-            if model.accounts.isEmpty || model.fatalError != nil { showWindow() }
+            if model.accounts.isEmpty || model.fatalError != nil || model.settings.showWindowAtLaunch { showWindow() }
         }
         Task {
             // Startup normally takes a moment. If it's still going, macOS is most
@@ -74,11 +82,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         present(window)
     }
 
-    func showSettings() {
-        if settingsWindow == nil {
-            settingsWindow = makeWindow(title: "Kitty Finder Settings", content: SettingsView().environment(model))
+    func showSettings(_ tab: SettingsTab? = nil) {
+        if settings == nil { settings = SettingsWindowController(model: model) }
+        if let tab { settings?.select(tab) }
+        present(settings?.window)
+    }
+
+    // Show notifications even while the menu is open, and open the right page when clicked.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .list]
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let id = response.notification.request.identifier
+        await MainActor.run {
+            let tab: SettingsTab = id.hasPrefix("update") ? .updates : id.hasPrefix("offline") ? .storage : .drives
+            self.showSettings(tab)
         }
-        present(settingsWindow)
     }
 
     private func makeWindow(title: String, content: some View) -> NSWindow {
@@ -140,7 +161,7 @@ final class StatusItemController: NSObject {
         item.autosaveName = Self.autosaveName
         item.behavior = []
         if let button = item.button {
-            button.image = KittyGlyph.image
+            button.image = KittyGlyph.image(.twoTone)
             button.imagePosition = .imageLeading
             button.toolTip = "Kitty Finder"
             button.setAccessibilityLabel("Kitty Finder")
@@ -176,10 +197,11 @@ final class StatusItemController: NSObject {
 
     private func updateBadge() {
         let pending = model.totalPendingUploads
+        item.button?.image = KittyGlyph.image(model.settings.menuBarIcon)
         let title: String
         if model.hasProblem {
             title = "!"
-        } else if pending > 0 {
+        } else if pending > 0 && model.settings.showUploadCount {
             title = "↑\(pending)"
         } else {
             title = ""
@@ -189,11 +211,32 @@ final class StatusItemController: NSObject {
     }
 }
 
-/// The two-tone kitty face from the app icon, as a monochrome template image
-/// so macOS tints it for light and dark menu bars.
+/// Menu bar icons, as monochrome template images so macOS tints them for
+/// light and dark menu bars.
+@MainActor
 enum KittyGlyph {
-    static let image: NSImage = {
-        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+    private static var cache: [MenuBarIconStyle: NSImage] = [:]
+
+    static func image(_ style: MenuBarIconStyle) -> NSImage {
+        if let image = cache[style] { return image }
+        let image: NSImage
+        switch style {
+        case .twoTone: image = kitty(outline: false)
+        case .outline: image = kitty(outline: true)
+        case .cloud:
+            let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+            image = NSImage(systemSymbolName: "cloud", accessibilityDescription: "Kitty Finder")?
+                .withSymbolConfiguration(config) ?? kitty(outline: false)
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "Kitty Finder"
+        cache[style] = image
+        return image
+    }
+
+    /// The kitty face from the app icon: two-tone (one half hollow), or a plain outline.
+    private static func kitty(outline: Bool) -> NSImage {
+        NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             let ctx = NSGraphicsContext.current!.cgContext
             NSColor.black.setFill()
             // Head with ears
@@ -205,18 +248,56 @@ enum KittyGlyph {
                 p.move(to: ear[0]); p.line(to: ear[1]); p.line(to: ear[2]); p.close()
                 p.fill()
             }
-            // Hollow out the left half of the face, leaving an outline: the "two tones"
             ctx.setBlendMode(.clear)
-            NSBezierPath(roundedRect: NSRect(x: 3.4, y: 5.9, width: 5.6, height: 8.7), xRadius: 2.3, yRadius: 2.3).fill()
-            // Right eye cut out of the solid half
-            NSBezierPath(ovalIn: NSRect(x: 11, y: 8.2, width: 2, height: 2.8)).fill()
-            // Left eye drawn into the hollow half
-            ctx.setBlendMode(.normal)
-            NSBezierPath(ovalIn: NSRect(x: 5, y: 8.2, width: 2, height: 2.8)).fill()
+            if outline {
+                // Hollow out the whole face, leaving its outline and solid ears
+                NSBezierPath(roundedRect: NSRect(x: 3.5, y: 6, width: 11, height: 8.5), xRadius: 2.4, yRadius: 2.4).fill()
+                ctx.setBlendMode(.normal)
+                NSBezierPath(ovalIn: NSRect(x: 5.6, y: 8.4, width: 1.9, height: 2.6)).fill()
+                NSBezierPath(ovalIn: NSRect(x: 10.5, y: 8.4, width: 1.9, height: 2.6)).fill()
+            } else {
+                // Hollow out the left half of the face, leaving an outline: the "two tones"
+                NSBezierPath(roundedRect: NSRect(x: 3.4, y: 5.9, width: 5.6, height: 8.7), xRadius: 2.3, yRadius: 2.3).fill()
+                // Right eye cut out of the solid half
+                NSBezierPath(ovalIn: NSRect(x: 11, y: 8.2, width: 2, height: 2.8)).fill()
+                // Left eye drawn into the hollow half
+                ctx.setBlendMode(.normal)
+                NSBezierPath(ovalIn: NSRect(x: 5, y: 8.2, width: 2, height: 2.8)).fill()
+            }
             return true
         }
-        image.isTemplate = true
-        image.accessibilityDescription = "Kitty Finder"
-        return image
-    }()
+    }
+}
+
+/// Finder's Services / Quick Actions entries for folders (declared as NSServices
+/// in Info.plist): "Keep Offline" and "Stop Keeping Offline".
+@MainActor
+final class FinderServices: NSObject {
+    private let model: AppModel
+
+    init(model: AppModel) { self.model = model }
+
+    @objc func keepOffline(_ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        handle(pasteboard) { await self.model.keepOffline($0) }
+    }
+
+    @objc func stopKeepingOffline(_ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        handle(pasteboard) { await self.model.stopKeepingOffline($0) }
+    }
+
+    private func handle(_ pasteboard: NSPasteboard, _ action: @escaping (URL) async -> String?) {
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        Task {
+            var problems: [String] = []
+            for url in urls {
+                if let problem = await action(url) { problems.append(problem) }
+            }
+            guard !problems.isEmpty else { return }
+            NSApp.activate()
+            let alert = NSAlert()
+            alert.messageText = "Kitty Finder"
+            alert.informativeText = problems.joined(separator: "\n\n")
+            alert.runModal()
+        }
+    }
 }

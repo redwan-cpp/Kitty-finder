@@ -6,7 +6,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.2.0}"
+# GitHub repository the in-app updater checks (forks: change this)
+UPDATE_REPOSITORY="${UPDATE_REPOSITORY:-redwan-cpp/Kitty-finder}"
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
 APP="$ROOT/build/Kitty Finder.app"
 
@@ -52,6 +54,24 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHumanReadableCopyright</key><string>Kitty Finder. Includes rclone (MIT).</string>
+  <key>KFUpdateRepository</key><string>$UPDATE_REPOSITORY</string>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key><dict><key>default</key><string>Keep Offline</string></dict>
+      <key>NSMessage</key><string>keepOffline</string>
+      <key>NSPortName</key><string>Kitty Finder</string>
+      <key>NSRequiredContext</key><dict/>
+      <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+    </dict>
+    <dict>
+      <key>NSMenuItem</key><dict><key>default</key><string>Stop Keeping Offline</string></dict>
+      <key>NSMessage</key><string>stopKeepingOffline</string>
+      <key>NSPortName</key><string>Kitty Finder</string>
+      <key>NSRequiredContext</key><dict/>
+      <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST

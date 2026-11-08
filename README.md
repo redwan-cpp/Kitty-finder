@@ -38,7 +38,9 @@ carrying an external drive.
 | **Downloads on demand** | Nothing is copied to your Mac until you open it. Large files only download the parts that are read, so videos start playing straight away. |
 | **Space stays free** | You choose how much space downloaded copies may use (10 GB by default). The least-recently-used ones are cleared automatically; they stay in the cloud. One click ("Free Up Space") clears them all. |
 | **Edits upload in the background** | Saving finishes at disk speed; the upload happens afterwards. The menu bar shows `↑3` while files are uploading. |
-| **Several accounts** | Add as many Google accounts as you like. |
+| **Works offline** | Right-click a folder → **Keep Offline**. Its files stay on your Mac and open with no internet, even after a restart; edits upload when you're back online. |
+| **Several accounts** | Add as many Google accounts as you like, and give each drive your own name. |
+| **Updates itself** | Kitty Finder checks GitHub once a day and installs new versions in place, after checking the download against GitHub's checksum. |
 | **Google Docs too** | Docs, Sheets and Slides appear as links that open in your browser. |
 | **Private** | Kitty Finder talks to Google directly from your Mac. There is no Kitty Finder server, account or analytics. Sign-ins are stored encrypted, with the key in your macOS keychain. |
 | **No system changes** | Uses macOS's built-in network-drive support. No kernel extensions, no admin password. |
@@ -62,6 +64,12 @@ Kitty Finder is a SwiftUI/AppKit menu bar app that runs a bundled copy of
     in Drive.
   - **0002** fixes a race where deleting or renaming a file while its upload
     was being cancelled left a ghost copy on Google Drive.
+  - **0003** adds pinned folders and an offline mode to rclone's VFS cache
+    (`vfs/pin`, `vfs/offline`): pinned files are never cleared and don't count
+    toward the space limit, and while offline, reads of files that aren't
+    downloaded fail at once and folders are listed from the cache.
+  - **0004** saves Google Drive's root folder ID in the config, so a drive can
+    start with no internet connection.
 - Settings are measured, not guessed: `spike/bench.py` benchmarks a real
   drive (results in `spike/bench-*.json`). Compared with rclone's defaults,
   uploading many files is 2.2× faster, folders open instantly once listed,
@@ -233,13 +241,34 @@ Repeat **Add Google Drive…** for more accounts.
 - **Menu bar icon:** the two-tone kitty sits near the clock. On a crowded
   menu bar macOS may hide it behind the notch. Hold **⌘** and drag it to
   move it, or open Kitty Finder again from Applications to get its window.
-- **Space limit:** **Settings → General** sets how much space downloaded
-  copies may use. **Settings → Accounts → Free Up Space** clears them at once
-  (it refuses while uploads are still pending, so nothing is lost).
+- **Space:** **Settings → Storage** sets how much space downloaded copies
+  may use, how much free space to always leave on the Mac, and after how many
+  days unused copies are cleared. **Settings → Drives → Free Up Space** clears
+  a drive's copies at once (it refuses while uploads are still pending, so
+  nothing is lost).
+- **Offline folders:** in Finder, right-click a folder in a drive →
+  **Quick Actions** (or **Services**) → **Keep Offline**, or use **Settings →
+  Storage → Add Folder…**. The menu shows each folder's progress. **Stop
+  Keeping Offline** undoes it.
+- **Your own names and places:** **Settings → Drives** renames a drive (its
+  Finder folder follows) and moves the drives folder somewhere else. Folders
+  synced by iCloud or another cloud app are refused, because they would copy
+  the whole drive back onto your Mac.
+- **Look and notifications:** **Settings → General** has three menu bar
+  icons, the upload counter, and notifications for upload problems, offline
+  folders and new versions.
 - **Sidebar:** to see the drive under Locations, enable **Finder → Settings →
   Sidebar → Connected servers**, or drag the drive's folder into the sidebar.
 
 ### Update to a newer version
+
+Kitty Finder checks for new versions once a day (**Settings → Updates**). When
+one is out, the menu says so: click it, then **Install and Relaunch**. It
+downloads the release from GitHub, checks it against the SHA-256 checksum
+GitHub published, replaces the app and reopens it; your drives come back by
+themselves. If anything fails, the current version keeps running.
+
+If you build from source:
 
 ```bash
 cd ~/Downloads/Kitty-finder
@@ -259,7 +288,10 @@ about the keychain again; click **Always Allow**.
 2. Delete `/Applications/Kitty Finder.app`.
 3. Delete `~/Library/Application Support/Kitty Finder` (settings, encrypted
    sign-ins and downloaded copies) and `~/Library/Logs/Kitty Finder`.
-4. Delete the empty `~/Kitty Finder` folder.
+4. Delete the empty `~/Kitty Finder` folder (or the drives folder you chose).
+
+Or use **Settings → About → Reset Kitty Finder…**, which does steps 3 and 4
+and the keychain item for you.
 5. Optional: remove the **Kitty Finder** item in **Keychain Access**, and
    remove the app's access at
    [myaccount.google.com/permissions](https://myaccount.google.com/permissions).
@@ -275,15 +307,16 @@ Nothing is ever deleted from your Google Drive by uninstalling.
 | "Google sign-in isn't set up yet" | Your build has no Google client. Do [Step 4](#step-4-create-your-google-sign-in-client) and rebuild, or paste a client into **Settings → Google**. |
 | "Access blocked" / "app not verified" with no Advanced option | The app is in **Testing** and your account isn't a test user. Add it under **Audience → Test users**. |
 | macOS shows "Server connections interrupted" | Click **Disconnect**, then in Kitty Finder click ⏸ and ▶︎ next to the account (or quit and reopen Kitty Finder). |
-| A file won't open while offline | Only files you've opened recently are kept on the Mac. |
-| Something else | Logs are in `~/Library/Logs/Kitty Finder` (Settings → General → Logs). |
+| A file won't open while offline | Only files in offline folders (and ones you opened recently) are on the Mac. Right-click the folder → **Keep Offline** while you're online. |
+| **Keep Offline** isn't in the right-click menu | Look under **Quick Actions** or **Services**. If it's not there, quit and reopen Finder (hold ⌥, right-click Finder in the Dock → **Relaunch**), and check **System Settings → Keyboard → Keyboard Shortcuts → Services → Files and Folders**. |
+| Something else | **Settings → About → Report a Problem** opens a GitHub issue; **Copy Diagnostics** adds versions and drive states without personal details. Logs are in `~/Library/Logs/Kitty Finder` (**Settings → About → Show Logs**). |
 
 ---
 
 ## For developers
 
 ```
-Sources/KittyFinderCore/   paths, accounts, rclone arguments, process running, keychain (unit-tested)
+Sources/KittyFinderCore/   paths, accounts, settings, rclone arguments, updates, offline folders (unit-tested)
 Sources/KittyFinder/       the menu bar app (AppKit status item + SwiftUI views)
 Tests/                     unit tests (Swift Testing)
 patches/rclone/            patches applied to the pinned rclone release
@@ -293,7 +326,7 @@ site/                      home page, privacy policy and terms (for Google's con
 docs/                      Google sign-in setup
 ```
 
-- The rclone patches come with Go tests: run `go test ./vfs/ ./cmd/serve/nfs/`
+- The rclone patches come with Go tests: run `go test ./vfs/... ./cmd/serve/nfs/`
   inside `build/rclone-src` after `scripts/build-rclone.sh`.
 - State on disk: settings and encrypted sign-ins in
   `~/Library/Application Support/Kitty Finder`, downloaded copies in its
@@ -302,8 +335,6 @@ docs/                      Google sign-in setup
 
 ### Roadmap
 
-- **Keep offline folders:** right-click a folder → Keep Offline, so it's always
-  available with no internet.
 - **More clouds:** Dropbox and OneDrive (rclone already supports them).
 - **Native Finder integration:** Apple's File Provider API (download badges,
   cloud thumbnails, signed releases). This needs a paid Apple Developer account.
