@@ -317,4 +317,4 @@ sending changes, and include a test that fails without your fix.
 
 Kitty Finder is open source under the [MIT License](LICENSE). It bundles
 [rclone](https://rclone.org), also MIT-licensed. The patches in
-`patches/rclone/` are provided under rclone's license.
+`patches/rclone/` are provided under rclone's license. See [NOTICE](NOTICE).

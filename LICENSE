@@ -19,10 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Kitty Finder bundles rclone (https://rclone.org), which is also licensed under
-the MIT License, Copyright (C) 2012 by Nick Craig-Wood. The patches in
-patches/rclone/ modify rclone and are provided under the same license. Built
-copies of the app include rclone's licence as Contents/Resources/rclone-COPYING.

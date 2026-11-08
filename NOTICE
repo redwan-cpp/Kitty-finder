@@ -1,0 +1,10 @@
+Kitty Finder
+Copyright (c) 2026 Redwan. Licensed under the MIT License (see LICENSE).
+
+Third-party software
+
+rclone (https://rclone.org)
+Copyright (C) 2012 by Nick Craig-Wood. Licensed under the MIT License.
+Built copies of Kitty Finder bundle rclone; its licence is included as
+Contents/Resources/rclone-COPYING. The patches in patches/rclone/ modify
+rclone and are provided under the same license.
