@@ -38,6 +38,12 @@ final class MountController {
     /// before they could be pinned over remote control).
     var offlineFolders: [String] = []
 
+    /// For benchmarking: `defaults write app.kittyfinder.KittyFinder UseBaselineTuning -bool true`
+    /// restores the original settings.
+    static var tuning: MountTuning {
+        UserDefaults.standard.bool(forKey: "UseBaselineTuning") ? .baseline : .tuned
+    }
+
     init(account: Account, paths: Paths, rclone: Rclone) {
         self.account = account
         self.paths = paths
@@ -142,11 +148,9 @@ final class MountController {
 
         let process = Process()
         process.executableURL = rclone.binary
-        // For benchmarking: `defaults write app.kittyfinder.KittyFinder UseBaselineTuning -bool true`
-        // restores the original settings; ExtraMountArguments (string array) adds rclone flags.
+        // ExtraMountArguments (string array) adds rclone flags, for testing.
         let defaults = UserDefaults.standard
-        let tuning: MountTuning = defaults.bool(forKey: "UseBaselineTuning") ? .baseline : .tuned
-        process.arguments = MountArguments.nfsmount(config, tuning: tuning, options: options,
+        process.arguments = MountArguments.nfsmount(config, tuning: Self.tuning, options: options,
                                                     extra: defaults.stringArray(forKey: "ExtraMountArguments") ?? [])
         process.environment = MountArguments.environment(configPassword: configPassword, rcUser: rc.user, rcPass: rc.password)
         process.standardInput = FileHandle.nullDevice

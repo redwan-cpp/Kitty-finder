@@ -152,9 +152,27 @@
 - Live on the real Drive: engine started with `--vfs-pin=kd-pin-test`; two files deleted
   from the cache while stopped were downloaded again in full at the next start.
 
-### Found, not fixed yet
+### Found in 0.2.1 (fixed in 0.2.2)
 - rclone names each cache folder after a hash of the Drive flags (`kd-<id>{C3LU_}`).
   Changing those flags (the Google Docs setting, or new tuning in an update) switches to a
   new, empty cache folder: the old one is never cleared or counted, offline folders download
   again, and edits that hadn't uploaded are left behind in it. This Mac already has 674 MB
   orphaned from tuning changes on 2026-11-06 (no unuploaded edits in it).
+
+## v0.2.2 — one cache folder per drive (2026-11-08)
+- [x] Root cause: `--drive-*` flags are "overridden config", so rclone renames the remote
+      `kd-<id>{hash}` and the VFS cache folder follows. Values in rclone.conf aren't overrides
+      (checked: a local remote gets `{yKcAd}` with a flag, no suffix with the same config value).
+- [x] Drive settings (chunk_size, pacer_min_sleep, pacer_burst, skip_gdocs, export_formats)
+      written with `rclone config update … config_refresh_token=false
+      config_change_team_drive=false --non-interactive` while engines are stopped, only when
+      they change; no `--drive-*` flags any more.
+- [x] One-time move (`CacheFolders.consolidate`): the most recently used folder becomes
+      `kd-<id>`, the others are deleted; unuploaded edits in them are first copied to
+      `<drives folder>/Recovered Edits/<drive>/` (never overwriting) and the menu says so.
+
+### Review
+- 45 unit tests (consolidation: newest kept, stale removed, edits recovered, no overwrite).
+- This Mac: second drive 3 folders → 1 (674 MB freed), main drive renamed with its 180 MB kept,
+  no Recovered Edits needed. Google Docs off → links gone with no `--drive-*` flags and the
+  same cache folder; on again → links back, downloads intact.

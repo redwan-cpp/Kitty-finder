@@ -87,6 +87,17 @@ public enum RemoteArguments {
         ]
     }
 
+    /// Writes settings into a remote's section of the config, without asking
+    /// to sign in again or to pick a shared drive. An empty value means rclone's default.
+    public static func update(name: String, settings: [String: String], configPath: String) -> [String] {
+        ["config", "update", name] + settings.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" } + [
+            "config_refresh_token=false",
+            "config_change_team_drive=false",
+            "--non-interactive",
+            "--config", configPath,
+        ]
+    }
+
     public static func delete(name: String, configPath: String) -> [String] {
         ["config", "delete", name, "--config", configPath]
     }

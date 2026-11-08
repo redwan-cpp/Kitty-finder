@@ -37,6 +37,21 @@ struct MenuContent: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if model.recoveredEdits > 0 {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Kitty Finder found \(model.recoveredEdits) edit\(model.recoveredEdits == 1 ? "" : "s") from an earlier version that never uploaded, and saved a copy in “Recovered Edits”. Nothing on Google Drive was changed.",
+                          systemImage: "doc.badge.clock")
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button("Show in Finder") { model.showRecoveredEdits() }
+                        Spacer()
+                        Button("Dismiss") { model.dismissRecoveredEdits() }
+                    }
+                }
+                .padding(10)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            }
+
             if let release = model.updater.available {
                 Button {
                     model.openSettingsHandler?(.updates)

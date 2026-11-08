@@ -38,7 +38,8 @@ import Testing
         #expect(!tuned.contains("--vfs-read-chunk-streams"), "measured slower: delays a file's first bytes")
         #expect(value(after: "--vfs-write-back", in: tuned) == "5s")
         #expect(value(after: "--transfers", in: tuned) == "8")
-        #expect(value(after: "--drive-pacer-min-sleep", in: tuned) == "10ms")
+        #expect(MountTuning.tuned.driveSettings == ["chunk_size": "32M", "pacer_min_sleep": "10ms", "pacer_burst": "200"])
+        #expect(MountTuning.baseline.driveSettings.values.allSatisfy { $0.isEmpty }, "baseline: rclone's defaults")
         // Long listing cache is only safe with change polling on
         #expect(value(after: "--poll-interval", in: tuned) == "15s")
 
@@ -53,7 +54,9 @@ import Testing
         for args in [tuned, baseline] {
             #expect(args.contains("locallocks") && args.contains("--nfs-apple-meta-dir"))
             #expect(args.contains("--links"), "folders with symlinks must copy in")
-            #expect(args.contains("--drive-skip-gdocs=false") && value(after: "--drive-export-formats", in: args) == "webloc")
+            // As flags, Drive settings change the engine's name for the drive, and with it
+            // its cache folder: downloads, offline folders and unuploaded edits get left behind.
+            #expect(!args.contains { $0.hasPrefix("--drive-") }, "Drive settings belong in rclone.conf")
             #expect(value(after: "--vfs-cache-mode", in: args) == "full")
         }
     }
@@ -132,6 +135,13 @@ import Testing
                          "config_refresh_token=false", "config_change_team_drive=false", "--non-interactive"] {
             #expect(args.contains(expected), "\(expected)")
         }
+    }
+
+    @Test func updateDriveSettingsArguments() {
+        let args = RemoteArguments.update(name: "kd-a", settings: ["skip_gdocs": "true", "chunk_size": ""], configPath: "/c.conf")
+        #expect(args == ["config", "update", "kd-a", "chunk_size=", "skip_gdocs=true",
+                         "config_refresh_token=false", "config_change_team_drive=false", "--non-interactive",
+                         "--config", "/c.conf"], "never asks to sign in again or pick a shared drive")
     }
 
     @Test func oauthClientResolve() {
@@ -279,7 +289,8 @@ import Testing
         #expect(value(after: "--vfs-cache-max-age", in: args) == "168h")
         #expect(value(after: "--poll-interval", in: args) == "60s")
         #expect(!args.contains("--vfs-cache-min-free-space"), "0 GB means off")
-        #expect(args.contains("--drive-skip-gdocs=true") && !args.contains("--drive-export-formats"))
+        #expect(s.mountOptions.driveSettings == ["skip_gdocs": "true", "export_formats": "webloc"])
+        #expect(MountOptions().driveSettings == ["skip_gdocs": "false", "export_formats": "webloc"])
         s.keepFreeGB = 5
         #expect(value(after: "--vfs-cache-min-free-space", in: MountArguments.nfsmount(config, options: s.mountOptions)) == "5368709120B")
     }
@@ -518,5 +529,77 @@ final class Seen: @unchecked Sendable {
         #expect(!CacheInspector.isFullyCached("a/placeholder.txt", metaRoot: meta), "an entry with no data yet")
         #expect(CacheInspector.isFullyCached("a/edited.txt", metaRoot: meta))
         #expect(!CacheInspector.isFullyCached("a/missing.txt", metaRoot: meta))
+    }
+}
+
+@Suite struct CacheFolderTests {
+    let fm = FileManager.default
+
+    /// A cache folder as rclone lays it out: vfs/<name>/<path> data, vfsMeta/<name>/<path> records.
+    private func add(_ cache: URL, _ name: String, _ path: String, contents: String, dirty: Bool = false, age: TimeInterval = 0) throws {
+        let data = cache.appending(path: "vfs/\(name)/\(path)"), meta = cache.appending(path: "vfsMeta/\(name)/\(path)")
+        for url in [data, meta] { try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true) }
+        try Data(contents.utf8).write(to: data)
+        try Data(#"{"Size":\#(contents.utf8.count),"Rs":[{"Pos":0,"Size":\#(contents.utf8.count)}],"Fingerprint":"f","Dirty":\#(dirty)}"#.utf8).write(to: meta)
+        let date = Date().addingTimeInterval(-age)
+        for url in [data, meta] { try fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path) }
+    }
+
+    private func names(_ cache: URL, _ kind: String) -> [String] {
+        ((try? fm.contentsOfDirectory(atPath: cache.appending(path: kind).path)) ?? []).sorted()
+    }
+
+    private func read(_ url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
+
+    @Test func newestFolderBecomesTheOneFolderAndOldEditsAreSaved() throws {
+        let root = fm.temporaryDirectory.appending(path: "kf-cache-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let cache = root.appending(path: "cache"), recovered = root.appending(path: "Recovered Edits/My Drive")
+        try add(cache, "kd-a", "stale.txt", contents: "from 0.1.0", age: 3 * 86400)
+        try add(cache, "kd-a{OLD}", "notes/todo.txt", contents: "edit that never uploaded", dirty: true, age: 86400)
+        try add(cache, "kd-a{OLD}", "photo.jpg", contents: "old download", age: 86400)
+        try add(cache, "kd-a{NEW}", "notes/todo.txt", contents: "current", age: 60)
+        try add(cache, "kd-a{NEW}", "offline/keep.txt", contents: "offline copy", age: 60)
+        try add(cache, "kd-b{XYZ}", "other.txt", contents: "another drive", age: 0)
+
+        let result = try CacheFolders.consolidate(cacheDir: cache, remoteName: "kd-a", recoverTo: recovered)
+
+        #expect(names(cache, "vfs") == ["kd-a", "kd-b{XYZ}"] && names(cache, "vfsMeta") == ["kd-a", "kd-b{XYZ}"],
+                "one folder per drive, other drives untouched")
+        #expect(read(cache.appending(path: "vfs/kd-a/offline/keep.txt")) == "offline copy", "the newest folder is kept")
+        #expect(read(cache.appending(path: "vfsMeta/kd-a/offline/keep.txt")) != nil)
+        #expect(read(cache.appending(path: "vfs/kd-a/stale.txt")) == nil, "the stale folder is gone")
+        #expect(result.recovered == ["notes/todo.txt"])
+        #expect(read(recovered.appending(path: "notes/todo.txt")) == "edit that never uploaded")
+        #expect(result.removedBytes > 0)
+    }
+
+    @Test func recoveredEditsNeverOverwrite() throws {
+        let root = fm.temporaryDirectory.appending(path: "kf-cache-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let cache = root.appending(path: "cache"), recovered = root.appending(path: "Recovered")
+        try fm.createDirectory(at: recovered, withIntermediateDirectories: true)
+        try Data("saved earlier".utf8).write(to: recovered.appending(path: "a.txt"))
+        try add(cache, "kd-a", "keep.txt", contents: "live", age: 0)
+        try add(cache, "kd-a{OLD}", "a.txt", contents: "second rescue", dirty: true, age: 100)
+
+        let result = try CacheFolders.consolidate(cacheDir: cache, remoteName: "kd-a", recoverTo: recovered)
+        #expect(result.recovered == ["a.txt"])
+        #expect(read(recovered.appending(path: "a.txt")) == "saved earlier")
+        #expect(read(recovered.appending(path: "a 2.txt")) == "second rescue")
+        #expect(names(cache, "vfs") == ["kd-a"])
+        #expect(read(cache.appending(path: "vfs/kd-a/keep.txt")) == "live", "already the one folder: kept as is")
+    }
+
+    @Test func nothingToDo() throws {
+        let root = fm.temporaryDirectory.appending(path: "kf-cache-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let cache = root.appending(path: "cache")
+        let empty = try CacheFolders.consolidate(cacheDir: cache, remoteName: "kd-a", recoverTo: root.appending(path: "R"))
+        #expect(empty.recovered.isEmpty && empty.removedBytes == 0)
+        try add(cache, "kd-a", "x.txt", contents: "x")
+        let single = try CacheFolders.consolidate(cacheDir: cache, remoteName: "kd-a", recoverTo: root.appending(path: "R"))
+        #expect(single.recovered.isEmpty && single.removedBytes == 0 && names(cache, "vfs") == ["kd-a"])
+        #expect(!fm.fileExists(atPath: root.appending(path: "R").path), "no Recovered Edits folder unless something was saved")
     }
 }

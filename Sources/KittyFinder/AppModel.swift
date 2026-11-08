@@ -26,6 +26,8 @@ final class AppModel {
     private(set) var isOffline = false
     /// The sync engine's version, e.g. "v1.75.2".
     private(set) var engineVersion = ""
+    /// Edits found unuploaded in old cache folders and saved to `recoveredEditsFolder`.
+    private(set) var recoveredEdits = 0
     let updater = Updater()
     /// Opens the Settings window; set by the app delegate.
     @ObservationIgnored var openSettingsHandler: ((SettingsTab?) -> Void)?
@@ -34,6 +36,8 @@ final class AppModel {
     private var configPassword = ""
     private var signInTask: Task<Void, Never>?
     private var observing = false
+    /// Drive settings last written to each account's section of rclone.conf.
+    private var appliedDriveSettings: [String: [String: String]] = [:]
     private var lastProblem: [String: (message: String, date: Date)] = [:]
     @ObservationIgnored private let network = NWPathMonitor()
     private static let keychainAccount = "rclone-config"
@@ -75,6 +79,11 @@ final class AppModel {
         } catch {
             fatalError = error.localizedDescription
             return
+        }
+        appliedDriveSettings = [:]
+        for account in accounts {
+            await applyDriveSettings(account)
+            await consolidateCache(account)
         }
         for account in accounts {
             let controller = makeController(for: account)
@@ -246,13 +255,62 @@ final class AppModel {
     private func restartDrive(_ id: String) async {
         guard rclone != nil, let account = accounts.first(where: { $0.id == id }) else { return }
         if let old = mounts[id] { await old.stop() }
+        await applyDriveSettings(account)
         let controller = makeController(for: account)
         if account.enabled { startDrive(controller) }
     }
 
+    /// Stops every drive before writing settings, so no engine is saving rclone.conf meanwhile.
     private func restartAllDrives() async {
-        for account in accounts { await restartDrive(account.id) }
+        guard rclone != nil else { return }
+        for controller in mounts.values { await controller.stop() }
+        for account in accounts {
+            await applyDriveSettings(account)
+            let controller = makeController(for: account)
+            if account.enabled { startDrive(controller) }
+        }
     }
+
+    /// Writes the account's Google Drive settings into rclone.conf when they changed.
+    /// Call while its engine is stopped: the engine reads them as it starts.
+    private func applyDriveSettings(_ account: Account) async {
+        guard let rclone else { return }
+        let wanted = MountArguments.driveSettings(tuning: MountController.tuning, options: settings.mountOptions)
+        guard appliedDriveSettings[account.id] != wanted else { return }
+        do {
+            try await rclone.check(RemoteArguments.update(name: account.remoteName, settings: wanted, configPath: paths.rcloneConfig.path),
+                                   environment: rcloneEnvironment)
+            appliedDriveSettings[account.id] = wanted
+        } catch {
+            NSLog("Kitty Finder: Drive settings for \(account.id): \(error.localizedDescription)")
+        }
+    }
+
+    /// Where edits that never uploaded are saved when an old cache folder is cleaned up.
+    var recoveredEditsFolder: URL { paths.mountRoot.appending(path: "Recovered Edits", directoryHint: .isDirectory) }
+
+    /// Moves the account's cache into its one folder (see `CacheFolders`). Engine must be stopped.
+    private func consolidateCache(_ account: Account) async {
+        let cacheDir = paths.cacheDir(for: account.id), remote = account.remoteName
+        let recoverTo = recoveredEditsFolder.appending(path: Account.folderName(account.title), directoryHint: .isDirectory)
+        do {
+            let result = try await Task.detached {
+                try CacheFolders.consolidate(cacheDir: cacheDir, remoteName: remote, recoverTo: recoverTo)
+            }.value
+            if result.removedBytes > 0 {
+                NSLog("Kitty Finder: removed \(ByteFormat.string(result.removedBytes)) of old cache for \(account.id)")
+            }
+            recoveredEdits += result.recovered.count
+        } catch {
+            NSLog("Kitty Finder: cache folders for \(account.id): \(error.localizedDescription)")
+        }
+    }
+
+    func showRecoveredEdits() {
+        NSWorkspace.shared.open(recoveredEditsFolder)
+    }
+
+    func dismissRecoveredEdits() { recoveredEdits = 0 }
 
     private func driveMounted(_ id: String) {
         guard let controller = mounts[id] else { return }

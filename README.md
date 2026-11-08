@@ -72,6 +72,11 @@ Kitty Finder is a SwiftUI/AppKit menu bar app that runs a bundled copy of
     start with no internet connection.
   - **0005** adds `--vfs-pin`, so offline folders are pinned before rclone's
     first cache clean-up at startup.
+- Google Drive settings (upload chunk size, request pacing, Google Docs) are
+  stored in each drive's section of `rclone.conf`, not passed as `--drive-*`
+  flags. With flags, rclone adds a hash of them to the drive's name, and its
+  cache folder is named after that, so any change would start a new, empty
+  cache and leave the old one behind.
 - Settings are measured, not guessed: `spike/bench.py` benchmarks a real
   drive (results in `spike/bench-*.json`). Compared with rclone's defaults,
   uploading many files is 2.2× faster, folders open instantly once listed,

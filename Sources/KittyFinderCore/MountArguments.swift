@@ -43,18 +43,17 @@ public struct MountTuning: Equatable, Sendable {
     public var readChunkSize: String
     /// Parallel uploads.
     public var transfers: Int
-    /// Google Drive upload chunk size (rclone default 8M).
-    public var driveChunkSize: String?
-    /// Google Drive request pacing (rclone default 100ms between calls, burst 100).
-    public var drivePacerMinSleep: String?
-    public var drivePacerBurst: Int?
+    /// Google Drive settings, stored in rclone.conf (see `MountArguments.driveSettings`):
+    /// upload chunk size (rclone default 8M) and request pacing (default 100ms
+    /// between calls, burst 100). An empty value means rclone's default.
+    public var driveSettings: [String: String]
     /// Delay after a file is closed before it uploads.
     public var writeBack: String
 
     public static let baseline = MountTuning(
         nfsTransferSize: nil, dirCacheTime: "5m", refreshOnStart: false,
         readChunkStreams: 0, readChunkSize: "128M", transfers: 4,
-        driveChunkSize: nil, drivePacerMinSleep: nil, drivePacerBurst: nil, writeBack: "5s")
+        driveSettings: ["chunk_size": "", "pacer_min_sleep": "", "pacer_burst": ""], writeBack: "5s")
 
     /// Measured on a real Drive (spike/bench-*.json): uploads of many files 2.2× faster,
     /// folders open instantly once listed, changes from elsewhere appear in ~35 s instead
@@ -63,7 +62,7 @@ public struct MountTuning: Equatable, Sendable {
     public static let tuned = MountTuning(
         nfsTransferSize: 1_048_576, dirCacheTime: "1000h", refreshOnStart: true,
         readChunkStreams: 0, readChunkSize: "128M", transfers: 8,
-        driveChunkSize: "32M", drivePacerMinSleep: "10ms", drivePacerBurst: 200, writeBack: "5s")
+        driveSettings: ["chunk_size": "32M", "pacer_min_sleep": "10ms", "pacer_burst": "200"], writeBack: "5s")
 
     var arguments: [String] {
         var args: [String] = []
@@ -75,9 +74,6 @@ public struct MountTuning: Equatable, Sendable {
         if refreshOnStart { args += ["--vfs-refresh"] }
         if readChunkStreams > 0 { args += ["--vfs-read-chunk-streams", "\(readChunkStreams)"] }
         args += ["--vfs-read-chunk-size", readChunkSize, "--transfers", "\(transfers)", "--vfs-write-back", writeBack]
-        if let size = driveChunkSize { args += ["--drive-chunk-size", size] }
-        if let sleep = drivePacerMinSleep { args += ["--drive-pacer-min-sleep", sleep] }
-        if let burst = drivePacerBurst { args += ["--drive-pacer-burst", "\(burst)"] }
         return args
     }
 }
@@ -104,11 +100,13 @@ public struct MountOptions: Equatable, Sendable {
     var arguments: [String] {
         var args = ["--vfs-cache-max-age", "\(keepCopiesHours)h", "--poll-interval", pollInterval]
         if keepFreeBytes > 0 { args += ["--vfs-cache-min-free-space", "\(keepFreeBytes)B"] }
-        // Google Docs, Sheets and Slides appear as .webloc links that open in the
-        // browser, so they can be seen, moved and deleted (and their folders too).
-        args += showGoogleDocs ? ["--drive-skip-gdocs=false", "--drive-export-formats", "webloc"]
-                               : ["--drive-skip-gdocs=true"]
         return args
+    }
+
+    /// Google Docs, Sheets and Slides appear as .webloc links that open in the
+    /// browser, so they can be seen, moved and deleted (and their folders too).
+    public var driveSettings: [String: String] {
+        ["skip_gdocs": showGoogleDocs ? "false" : "true", "export_formats": "webloc"]
     }
 }
 
@@ -149,6 +147,16 @@ public enum MountArguments {
         // "=" keeps a folder whose name starts with "-", or the whole drive (""), one argument
         + c.pinnedFolders.map { "--vfs-pin=\($0)" }
         + tuning.arguments + options.arguments + extra
+    }
+
+    /// Google Drive settings for the account's section of rclone.conf.
+    ///
+    /// They must not be passed as `--drive-*` flags: rclone then adds a hash of them
+    /// to the drive's name ("kd-a{C3LU_}"), and the VFS cache folder is named after
+    /// it, so changing a setting would leave the whole cache behind (downloads,
+    /// offline folders and edits not uploaded yet). Values in the config don't.
+    public static func driveSettings(tuning: MountTuning = .tuned, options: MountOptions = MountOptions()) -> [String: String] {
+        tuning.driveSettings.merging(options.driveSettings) { $1 }
     }
 
     /// Environment for any rclone call. `rcUser`/`rcPass` are only needed for mounts.
