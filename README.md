@@ -10,6 +10,12 @@ free space; your files stay in the cloud.
 
 <p align="center"><img src="Resources/AppIcon-readme.png" width="128" alt="Kitty Finder icon"></p>
 
+<p align="center">
+  <a href="docs/media/kitty-finder-intro.mp4"><img src="docs/media/kitty-finder-intro.gif" width="720" alt="Kitty Finder intro: a Mac that is almost full gets its whole Google Drive in Finder while using 0 GB, and an 18 GB video plays at once"></a>
+  <br>
+  <sub>▶︎ <a href="docs/media/kitty-finder-intro.mp4">Watch the 30-second intro with sound</a></sub>
+</p>
+
 ---
 
 ## The problem: Macs run out of space
